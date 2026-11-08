@@ -278,7 +278,7 @@ class UniData {
  */
 class UniBrowser {
    static sc := A_ScreenDPI / 72
-   static main := 0, grid := 0, edFilter := 0, chkSkin := 0, txtInfo := 0, btnCopy := 0
+   static main := 0, grid := 0, edFilter := 0, chkSkin := 0, txtInfo := 0, txtMetrics := 0, btnCopy := 0
    static tmr := 0
    static _d2d := 0, _dw := 0, rt := 0, br := 0, fmt := 0
    static rect := D2D1_RECT_F()
@@ -288,10 +288,12 @@ class UniBrowser {
    static clrSelFill    := this._Color("0x264F78")   ; selected cell fill
    static clrSelBorder  := this._Color("0x0078D7")   ; selected cell outline
    static clrGlyph      := this._Color("0xEBEBEB")   ; glyph color (color emoji ignore it)
-   static res := [], sel := 0, top := 0, cols := 1, rows := 0, page := 1
-   static cellW := 56.0, cellH := 56
-   static lastClick := 0, lastIdx := 0
-
+   static clrBounds     := this._Color("0xa35027")   ; text-box outline
+   static clrInk        := this._Color("0x2e85b1")   ; ink box from overhang metrics
+   static res           := [],   sel     := 0, top := 0, cols := 1, rows := 0, page := 1
+   static cellW         := 56.0, cellH   := 56
+   static lastClick     := 0,    lastIdx := 0
+   static showBounds    := true, showInk := true
    /**
     * Scale a 72-dpi design value to the current screen DPI.
     * @param {Number} n Unscaled size
@@ -319,6 +321,7 @@ class UniBrowser {
       this.chkSkin.Value := true
       this.txtInfo := g.AddText("x0 y0 w" this.S(100) " h" this.S(60) " 0x80")   ; SS_NOPREFIX: keep '&'
       this.txtInfo.Value := "Please Wait..."
+      this.txtMetrics := g.AddText("x0 y0 w" this.S(230) " h" this.S(60) " 0x80")
       this.btnCopy := g.AddButton("Default x0 y0 w" this.S(80) " h" this.S(30), "Copy")
       this.Dark(this.edFilter.Hwnd, "DarkMode_CFD") ; Color
       this.Dark(this.chkSkin.Hwnd) ; Color
@@ -488,8 +491,9 @@ class UniBrowser {
       If !this.rt
          Return
 
-      rt := this.rt, br := this.br, fmt := this.fmt, rect := this.rect
+      rt := this.rt, br := this.br, fmt := this.fmt, rect := this.rect, dw := this._dw
       cw := this.cellW, chh := this.cellH, cols := this.cols, top := this.top
+      showB := this.showBounds, showI := this.showInk
       n := this.res.Length
 
       D2D.BeginDraw(rt)
@@ -540,7 +544,7 @@ class UniBrowser {
                D2D.DrawRectangle(rt, rect, br, 1.5)
             }
 
-            ; pass 2: glyphs (color glyphs ignore the brush)
+            ; pass 2: glyphs (color glyphs ignore the brush), each followed by its optional outlines
             D2D.SetColor(br, this.clrGlyph)
 
             ; Reset grid position
@@ -556,13 +560,37 @@ class UniBrowser {
                If UniData.Fl[e] & 2
                   s := Chr(0x25CC) s
 
-               rect.left := col * cw
-               rect.top := row * chh
-               rect.right := (col + 1) * cw
-               rect.bottom := (row + 1) * chh
+               x := col * cw, y := row * chh
 
-               ; DrawText: options 6 = CLIP | ENABLE_COLOR_FONT
-               D2D.DrawText(rt, s, fmt, rect, br, 6)
+               ; Same string, format and cell-sized box as before; the layout also supplies the metrics
+               lay := D2D.CreateTextLayout(dw, s, fmt, cw, chh)
+               ; options 6 = CLIP | ENABLE_COLOR_FONT
+               D2D.DrawTextLayout(rt, x, y, lay, br, 6)
+
+               If showB {
+                  ; Advance x line height: the box the character occupies when inserted in a string
+                  m := D2D.GetMetrics(lay)
+                  rect.left := x + m.left
+                  rect.top := y + m.top
+                  rect.right := rect.left + m.widthIncludingTrailingWhitespace
+                  rect.bottom := rect.top + m.height
+                  D2D.SetColor(br, this.clrBounds)
+                  D2D.DrawRectangle(rt, rect, br, 1)
+               }
+               If showI {
+                  ; Ink box: overhang is relative to the layout box (the cell), so expand the cell by it
+                  o := D2D.GetOverhangMetrics(lay)
+                  rect.left := x - o.left
+                  rect.top := y - o.top
+                  rect.right := x + cw + o.right
+                  rect.bottom := y + chh + o.bottom
+                  D2D.SetColor(br, this.clrInk)
+                  D2D.DrawRectangle(rt, rect, br, 1)
+               }
+               If showB || showI
+                  D2D.SetColor(br, this.clrGlyph)
+
+               ObjRelease(lay)
 
                ; Advance grid position
                If ++col = cols
@@ -575,7 +603,101 @@ class UniBrowser {
          this.ReleaseRT()
          SetTimer(cbRecreate, -50)
       }
-   }
+   }   
+   ; Static Render() {
+   ;    Static cbRecreate := ObjBindMethod(this, "Recreate")
+
+   ;    If !this.rt
+   ;       Return
+
+   ;    rt := this.rt, br := this.br, fmt := this.fmt, rect := this.rect
+   ;    cw := this.cellW, chh := this.cellH, cols := this.cols, top := this.top
+   ;    n := this.res.Length
+
+   ;    D2D.BeginDraw(rt)
+   ;    D2D.Clear(rt, this.clrBack)
+
+   ;    ; Loop over each character and display in a grid
+   ;    If n {
+   ;       first := top * cols + 1
+   ;       last := Min(n, (top + this.page + 1) * cols)
+   ;       count := last - first + 1
+
+   ;       If count > 0 {
+   ;          ; Initial grid position
+   ;          pos := first - 1
+   ;          col := Mod(pos, cols)
+   ;          row := pos // cols - top
+
+   ;          ; pass 1: cell borders, then the selected cell
+   ;          D2D.SetColor(br, this.clrCellBorder)
+
+   ;          Loop count {
+   ;             rect.left := col * cw + 0.5
+   ;             rect.top := row * chh + 0.5
+   ;             rect.right := (col + 1) * cw - 0.5
+   ;             rect.bottom := (row + 1) * chh - 0.5
+
+   ;             D2D.DrawRectangle(rt, rect, br, 1)
+
+   ;             ; Advance grid position
+   ;             If ++col = cols
+   ;                col := 0, row++
+   ;          }
+   ;          ; Active selection (if applicable)
+   ;          If this.sel >= first && this.sel <= last {
+   ;             pos := this.sel - 1
+   ;             col := Mod(pos, cols)
+   ;             row := pos // cols - top
+
+   ;             rect.left := col * cw + 0.5
+   ;             rect.top := row * chh + 0.5
+   ;             rect.right := (col + 1) * cw - 0.5
+   ;             rect.bottom := (row + 1) * chh - 0.5
+
+   ;             D2D.SetColor(br, this.clrSelFill)
+   ;             D2D.FillRectangle(rt, rect, br)
+
+   ;             D2D.SetColor(br, this.clrSelBorder)
+   ;             D2D.DrawRectangle(rt, rect, br, 1.5)
+   ;          }
+
+   ;          ; pass 2: glyphs (color glyphs ignore the brush)
+   ;          D2D.SetColor(br, this.clrGlyph)
+
+   ;          ; Reset grid position
+   ;          pos := first - 1
+   ;          col := Mod(pos, cols)
+   ;          row := pos // cols - top
+
+   ;          Loop count {
+   ;             i := first + A_Index - 1
+   ;             e := this.res[i]
+   ;             s := UniData.Ch[e]
+
+   ;             If UniData.Fl[e] & 2
+   ;                s := Chr(0x25CC) s
+
+   ;             rect.left := col * cw
+   ;             rect.top := row * chh
+   ;             rect.right := (col + 1) * cw
+   ;             rect.bottom := (row + 1) * chh
+
+   ;             ; DrawText: options 6 = CLIP | ENABLE_COLOR_FONT
+   ;             D2D.DrawText(rt, s, fmt, rect, br, 6)
+
+   ;             ; Advance grid position
+   ;             If ++col = cols
+   ;                col := 0, row++
+   ;          }
+   ;       }
+   ;    }
+
+   ;    If D2D.EndDraw(rt) < 0 {   ; failed (device lost): rebuild and repaint
+   ;       this.ReleaseRT()
+   ;       SetTimer(cbRecreate, -50)
+   ;    }
+   ; }
    /**
     * Release the brush and render target if we have a reset
     */
@@ -714,7 +836,9 @@ class UniBrowser {
       this.edFilter.Move(pad, pad, w - pad * 3 - this.S(150), this.S(28))
       this.chkSkin.Move(w - pad - this.S(150), pad + this.S(4), this.S(150))
       this.grid.Move(0, topH, w, Max(1, h - topH - botH))
-      this.txtInfo.Move(pad, h - botH + this.S(6), w - pad * 3 - this.S(80), botH - this.S(10)) ; got sb here
+      mw := this.S(230)
+      this.txtInfo.Move(pad, h - botH + this.S(6), w - pad * 4 - this.S(80) - mw, botH - this.S(10))
+      this.txtMetrics.Move(w - pad * 2 - this.S(80) - mw, h - botH + this.S(6), mw, botH - this.S(10))      
       this.btnCopy.Move(w - pad - this.S(80), h - botH + this.S(6), this.S(80), this.S(30))
       if this.rt {
          this.ClientSize(this.grid.Hwnd, &gw, &gh)
@@ -726,7 +850,23 @@ class UniBrowser {
          ; this.Render()
       }
    }
-
+   /**
+    * Measure an entry with DirectWrite, using the grid's text format and a cell-sized layout box.
+    * @param {Integer} e Entry index
+    * @returns {DWRITE_TEXT_METRICS}
+    */
+   static CharMetrics(e) {
+      s := UniData.Ch[e]
+      if UniData.Fl[e] & 2
+         s := Chr(0x25CC) s
+      lay := D2D.CreateTextLayout(this._dw, s, this.fmt, this.cellW, this.cellH)
+      m := D2D.GetMetrics(lay)
+      D2D.SetMaxWidth(lay, m.widthIncludingTrailingWhitespace)   ; box = the advance
+      D2D.SetMaxHeight(lay, m.height)                            ; and the line height
+      o := D2D.GetOverhangMetrics(lay)
+      ObjRelease(lay)
+      return {M: m, O: o}
+   }
    ; ---------------------------------------------------------------- messages
 
    /**
@@ -821,7 +961,7 @@ class UniBrowser {
     * then relayout and repaint. Also used as the skin-tone checkbox Click handler.
     * @returns {unset?}
     */
-   static Refilter(*) {
+   static Refilter(*) { 
       text := Trim(this.edFilter.Value)
       this.sel := 0, this.top := 0
       this.res := text = "" ? [] : UniData.Search(text, this.chkSkin.Value)
@@ -835,18 +975,25 @@ class UniBrowser {
     * (prompt, match count, or no matches) when nothing is selected.
     * @returns {unset?}
     */
-   static ShowInfo() {
-      if this.sel {
+   Static ShowInfo() {
+      If this.sel {
          i := this.res[this.sel]
          kw := Trim(UniData.Kw[i])
-         if StrLen(kw) > 140
+         If StrLen(kw) > 140
             kw := SubStr(kw, 1, 140) "..."
          grp := UniData.Gr[i] != "" ? "   |   " UniData.Gr[i] : ""
          this.txtInfo.Value := UniData.Nm[i] "`n" UniData.Hx[i] grp "`n" kw
-      } else if Trim(this.edFilter.Value) = ""
+         ob := this.CharMetrics(i)
+         m := ob.M, O := ob.O
+         this.txtMetrics.Value := Format("Left {:.1f}   Top {:.1f}`nWidth {:.1f}   Trailing {:.1f}`nHeight {:.1f}   Lines {}`nOverhang {:.1f} x {:.1f}"
+            , m.left, m.top, m.width, m.widthIncludingTrailingWhitespace, m.height, m.lineCount, -O.left, -O.right)
+
+      } Else If Trim(this.edFilter.Value) = ""
          this.txtInfo.Value := "Type in the filter box to show characters."
-      else
+      Else {
          this.txtInfo.Value := this.res.Length ? this.res.Length " matching characters" : "No matches"
+         this.txtMetrics.Value := ""
+      }
    }
 
    /**
