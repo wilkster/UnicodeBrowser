@@ -1,0 +1,891 @@
+;@Ahk2Exe-SetName UnicodeBrowser
+;@Ahk2Exe-SetDescription UnicodeBrowser
+;@Ahk2Exe-Set Comments, Unicode and Emoji Browser
+;@Ahk2Exe-SetVersion 2026.10.12
+;@Ahk2Exe-SetCopyright Copyright (c) 2026 Tom Wilkason
+;@Ahk2Exe-SetOrigFilename UnicodeBrowser.exe
+;@Ahk2Exe-SetMainIcon Tray.ico
+
+#Requires AutoHotkey v2.1-
+#SingleInstance Force
+#DllLoad "ole32.dll"
+#DllLoad "d2d1.dll"
+#DllLoad "dwrite.dll"
+#Include "clsD2D.ahk2"
+TraySetIcon(A_ScriptDir "\tray.ico")
+; Unicode / emoji browser
+; - One Direct2D HwndRenderTarget draws the visible cells only (virtual grid), so
+;   color emoji render via DrawText + ENABLE_COLOR_FONT and scrolling stays cheap.
+; - Nothing is shown until the filter box has text.
+; - Data (downloaded once, cached in .\UnicodeData\ - delete the folder to refresh):
+;     emoji-test.txt   emoji names, groups, ZWJ/flag/skin-tone sequences
+;     UnicodeData.txt  names for every individually named character
+;     Blocks.txt       block names (used as the "group" for non-emoji)
+;     CLDR annotations keywords + spoken names (en) from unicode-org/cldr-json
+; - Filter: words are ANDed and match name, keywords, group or the character itself.
+;   A term starting with "u+" matches code points, e.g.  u+1f60   or   arrow u+219
+; - Click selects, double-click or Enter copies. Mouse wheel scrolls over the grid.
+/* TODO
+ * x OnMessage should be changed to Gui.OnMessage for the grid only
+ * x this.Cf(58, 58, 58) => Make thes part of a theme and as fixed   (grid colors are now the clr* properties; Start() colors are still hard coded)
+ * x Wrap the ComCalls in descriptive names ComCall(27,,,,) > DrawText(...)   (see D2D.ahk2)
+*/
+
+/**
+ * Static data store for the browser. Loads, caches and searches Unicode/emoji data.
+ * Entries are held in parallel arrays (Ch, Nm, Gr, Kw, Hx, Fl, Sr) addressed by the same entry index.
+ * Ch = character string, Nm = display name, Gr = group/block, Kw = keywords, Hx = "U+XXXX" code point text,
+ * Fl = flag bits (1 = skin-tone variant, 2 = combining mark), Sr = combined search string (character, name, keywords, group).
+ * Idx maps a character (VS16 stripped) to its entry index.
+ */
+struct RECT {
+   left  : Int32
+   top   : Int32
+   right : Int32
+   bottom: Int32
+}
+class UniData {
+   static Dir := A_ScriptDir "\UnicodeData"
+   static Ch := [], Nm := [], Gr := [], Kw := [], Hx := [], Fl := [], Sr := []
+   static Idx := Map()
+   static VS16 := Chr(0xFE0F)
+
+   ; Fl bit 1 = skin-tone variant, bit 2 = combining mark (drawn on a dotted circle)
+
+   /**
+    * Download (first run only) and parse every data source, then build the combined search strings.
+    * Shows a tooltip while working. Call once before using Search.
+    * @throws {Error} If a required data file cannot be downloaded
+    * @returns {unset?}
+    */
+   static Load() {
+      DirCreate(this.Dir)
+      ToolTip("Loading Unicode data (first run downloads ~4 MB)...")
+      ucd := "https://www.unicode.org/Public/UCD/latest/ucd/"
+      cldr := "https://raw.githubusercontent.com/unicode-org/cldr-json/main/cldr-json/"
+      fEmoji := this.Fetch("emoji-test.txt", "https://www.unicode.org/Public/emoji/latest/emoji-test.txt")
+      fUni := this.Fetch("UnicodeData.txt", ucd "UnicodeData.txt")
+      fBlk := this.Fetch("Blocks.txt", ucd "Blocks.txt", false)
+      fAnn := this.Fetch("annotations-en.json"
+         , cldr "cldr-annotations-full/annotations/en/annotations.json", false)
+      fDer := this.Fetch("annotations-derived-en.json"
+         , cldr "cldr-annotations-derived-full/annotationsDerived/en/annotations.json", false)
+
+      this.LoadEmoji(fEmoji)
+      this.LoadUnicodeData(fUni, fBlk)
+      for f in [fAnn, fDer] {
+         if f != ""
+            this.ApplyAnnotations(f)
+      }
+      Loop this.Ch.Length {
+         i := A_Index
+         this.Sr.Push(this.Ch[i] " " this.Nm[i] " " this.Kw[i] " " this.Gr[i])
+      }
+      ToolTip()
+   }
+
+   /**
+    * Return the cached copy of a data file, downloading it first if it is missing or empty.
+    * @param {String} name File name inside the cache folder (UniData.Dir)
+    * @param {String} url URL to download from when not cached
+    * @param {Boolean} [required=true] Throw on download failure; otherwise return an empty string
+    * @throws {Error} If the download fails and required is true
+    * @returns {String} Full path of the cached file, or "" if an optional download failed
+    */
+   static Fetch(name, url, required := true) {
+      f := this.Dir "\" name
+      if FileExist(f) && FileGetSize(f) > 0
+         return f
+      hr := DllCall("urlmon\URLDownloadToFileW", "Ptr", 0, "Str", url, "Str", f, "UInt", 0, "Ptr", 0, "UInt")
+      if hr != 0 || !FileExist(f) || FileGetSize(f) = 0 {
+         try FileDelete(f)
+         if required
+            throw Error("Download failed: " url)
+         return ""
+      }
+      return f
+   }
+
+   /**
+    * Append one entry to every parallel array and register it in the Idx lookup.
+    * @param {String} key Lookup key stored in Idx (the character with VS16 removed)
+    * @param {String} ch Character or sequence to display and copy
+    * @param {String} name Display name
+    * @param {String} group Emoji group or Unicode block name (may be empty)
+    * @param {String} hx Space-separated code points, e.g. "U+1F600"
+    * @param {Integer} fl Flag bits: 1 = skin-tone variant, 2 = combining mark
+    * @returns {unset?}
+    */
+   static Add(key, ch, name, group, hx, fl) {
+      this.Ch.Push(ch)
+      this.Nm.Push(name)
+      this.Gr.Push(group)
+      this.Kw.Push("")
+      this.Hx.Push(hx)
+      this.Fl.Push(fl)
+      this.Idx[key] := this.Ch.Length
+   }
+
+   /**
+    * Parse emoji-test.txt. Only fully-qualified entries are added, using the file's `# group:` headers
+    * as the group. Skin-tone modifier code points (U+1F3FB-U+1F3FF) set flag bit 1.
+    * @param {String} file Path to emoji-test.txt
+    * @returns {unset?}
+    */
+   static LoadEmoji(file) {
+      group := ""
+      for line in StrSplit(FileRead(file, "UTF-8"), "`n", "`r") {
+         if line = ""
+            continue
+         if SubStr(line, 1, 1) = "#" {
+            if RegExMatch(line, "^# group: (.+)$", &g)
+               group := g[1]
+            continue
+         }
+         if !RegExMatch(line, "^([0-9A-F]+(?: [0-9A-F]+)*)\s*;\s*(\S+)\s*#\s*\S+\s+E[\d.]+\s+(.+)$", &m)
+            || m[2] != "fully-qualified"
+            continue
+         s := "", hx := "", fl := 0
+         for h in StrSplit(m[1], " ") {
+            cp := Integer("0x" h)
+            s .= Chr(cp)
+            hx .= (hx = "" ? "" : " ") . Format("U+{:04X}", cp)
+            if cp >= 0x1F3FB && cp <= 0x1F3FF
+               fl |= 1
+         }
+         this.Add(StrReplace(s, this.VS16), s, m[3], group, hx, fl)
+      }
+   }
+
+   /**
+    * Parse UnicodeData.txt and add every individually named, non-control character not already present.
+    * Characters already added from emoji-test keep their short name; the formal name becomes a keyword.
+    * Combining marks (category M*) set flag bit 2. The group is taken from Blocks.txt when available.
+    * @param {String} file Path to UnicodeData.txt
+    * @param {String} blkFile Path to Blocks.txt, or "" to leave the group blank
+    * @returns {unset?}
+    */
+   static LoadUnicodeData(file, blkFile) {
+      bLo := [], bHi := [], bNm := []
+      if blkFile != "" {
+         for line in StrSplit(FileRead(blkFile, "UTF-8"), "`n", "`r") {
+            if RegExMatch(line, "^([0-9A-F]+)\.\.([0-9A-F]+);\s*(.+)$", &b) {
+               bLo.Push(Integer("0x" b[1]))
+               bHi.Push(Integer("0x" b[2]))
+               bNm.Push(Trim(b[3]))
+            }
+         }
+      }
+      bi := 1
+      Loop Parse FileRead(file, "UTF-8"), "`n", "`r" {
+         if !RegExMatch(A_LoopField, "^([0-9A-F]+);([^;]*);(\w\w);", &m)
+            continue
+         name := m[2], cat := m[3]
+         if SubStr(name, 1, 1) = "<" || SubStr(cat, 1, 1) = "C"
+            continue   ; ranges, controls, format, private use, surrogates
+         cp := Integer("0x" m[1])
+         ch := Chr(cp)
+         if this.Idx.Has(ch) {
+            ; already added from emoji-test: keep its short name, add the formal name as a keyword
+            this.Kw[this.Idx[ch]] .= " " StrTitle(name)
+            continue
+         }
+         group := ""
+         if bNm.Length {
+            while bi < bNm.Length && cp > bHi[bi]
+               bi++
+            if cp >= bLo[bi] && cp <= bHi[bi]
+               group := bNm[bi]
+         }
+         this.Add(ch, ch, StrTitle(name), group, Format("U+{:04X}", cp), SubStr(cat, 1, 1) = "M" ? 2 : 0)
+      }
+   }
+
+   /**
+    * Append CLDR keywords and spoken (tts) names from an annotations JSON file to matching entries.
+    * Entries are matched by character (VS16 stripped); unknown characters are ignored.
+    * @param {String} file Path to a CLDR annotations.json file
+    * @returns {unset?}
+    */
+   static ApplyAnnotations(file) {
+      txt := FileRead(file, "UTF-8")
+      pos := 1
+      while pos := RegExMatch(txt, '"([^"\\]+)":\s*\{\s*"default":\s*\[([^\]]*)\],\s*"tts":\s*\[\s*"([^"]*)"', &m, pos) {
+         pos += m.Len
+         key := StrReplace(m[1], this.VS16)
+         if !this.Idx.Has(key)
+            continue
+         kws := " " m[3]
+         p2 := 1
+         while p2 := RegExMatch(m[2], '"([^"]*)"', &k, p2) {
+            kws .= " " k[1]
+            p2 += k.Len
+         }
+         this.Kw[this.Idx[key]] .= kws
+      }
+   }
+
+   /**
+    * Find entries matching every term in text. Plain terms must appear in the search string
+    * (character, name, keywords, group); terms starting with "u+" must appear in the code point text.
+    * @param {String} text Space-separated search terms, e.g. "arrow u+219"
+    * @param {Boolean} [hideSkin=false] Skip skin-tone variants
+    * @returns {Array} Entry indexes of all matches, in data order
+    */
+   static Search(text, hideSkin := false) {
+      tx := [], hx := []
+      for t in StrSplit(text, " ") {
+         if t = ""
+            continue
+         if SubStr(t, 1, 2) = "u+"
+            hx.Push(t)
+         else
+            tx.Push(t)
+      }
+      res := []
+      Sr := this.Sr, Hxs := this.Hx, Fl := this.Fl
+      for i, s in Sr {
+         if hideSkin && (Fl[i] & 1)
+            continue
+         ok := true
+         ; Wildcard search would be done here
+         for t in tx {
+            if !InStr(s, t) {
+               ok := false
+               break
+            }
+         }
+         if ok {
+            for t in hx {
+               if !InStr(Hxs[i], t) {
+                  ok := false
+                  break
+               }
+            }
+         }
+         if ok
+            res.Push(i)
+      }
+      return res
+   }
+}
+
+/**
+ * GUI and Direct2D grid renderer for the Unicode browser.
+ * A child window (grid) hosts one ID2D1HwndRenderTarget that draws only the visible cells (virtual grid).
+ * State: res = matching entry indexes, sel = selected position in res (0 = none), top = first visible row,
+ * cols/rows/page = grid geometry, cellW/cellH = cell size in pixels.
+ */
+class UniBrowser {
+   static sc := A_ScreenDPI / 72
+   static main := 0, grid := 0, edFilter := 0, chkSkin := 0, txtInfo := 0, btnCopy := 0
+   static tmr := 0
+   static _d2d := 0, _dw := 0, rt := 0, br := 0, fmt := 0
+   static rect := D2D1_RECT_F()
+   ; Grid theme colors as 0xRRGGBB. _Color builds each one once as a D2D1_COLOR_F, ready for the D2D calls.
+   static clrBack       := this._Color("0x202020")   ; grid background
+   static clrCellBorder := this._Color("0x3A3A3A")   ; cell outlines
+   static clrSelFill    := this._Color("0x264F78")   ; selected cell fill
+   static clrSelBorder  := this._Color("0x0078D7")   ; selected cell outline
+   static clrGlyph      := this._Color("0xEBEBEB")   ; glyph color (color emoji ignore it)
+   static res := [], sel := 0, top := 0, cols := 1, rows := 0, page := 1
+   static cellW := 56.0, cellH := 56
+   static lastClick := 0, lastIdx := 0
+
+   /**
+    * Scale a 72-dpi design value to the current screen DPI.
+    * @param {Number} n Unscaled size
+    * @returns {Integer} Scaled size in pixels
+    */
+   static S(n) => Round(n * this.sc)
+
+   /**
+    * Load the data, build the GUI and grid window, register message handlers and show the window.
+    * @returns {unset?}
+    */
+   static Start() {
+      UniData.Load()
+      this.tmr := ObjBindMethod(this, "Refilter")
+
+      this.InitDark() ; Color
+      g := this.main := Gui("+Resize -DPIScale +MinSize" this.S(420) "x" this.S(300), "Unicode Browser")
+      g.BackColor := "202020" ; Color
+      this.DarkTitle(g.Hwnd)
+      g.SetFont("s14 bold cE6E6E6", "Segoe UI")
+      this.edFilter := g.AddEdit("x" this.S(8) " y" this.S(8) " w" this.S(300) " h" this.S(28) " Background2D2D2D")
+      SendMessage(0x1501, true, StrPtr("Search name, keyword, group or u+hex"), this.edFilter)   ; EM_SETCUEBANNER
+      g.SetFont("s10 Norm cE6E6E6", "Segoe UI")
+      this.chkSkin := g.AddCheckbox("x0 y0 w" this.S(150), "Hide skin tones")
+      this.chkSkin.Value := true
+      this.txtInfo := g.AddText("x0 y0 w" this.S(100) " h" this.S(60) " 0x80")   ; SS_NOPREFIX: keep '&'
+      this.txtInfo.Value := "Please Wait..."
+      this.btnCopy := g.AddButton("Default x0 y0 w" this.S(80) " h" this.S(30), "Copy")
+      this.Dark(this.edFilter.Hwnd, "DarkMode_CFD") ; Color
+      this.Dark(this.chkSkin.Hwnd) ; Color
+      this.Dark(this.btnCopy.Hwnd) ; Color
+      this.edFilter.OnEvent("Change", this.OnFilter.Bind(this))
+      this.chkSkin.OnEvent("Click", this.Refilter.Bind(this))
+      this.btnCopy.OnEvent("Click", this.CopyEnter.Bind(this))
+      g.OnEvent("Size", this.OnSize.Bind(this))
+      g.OnEvent("Close", (*) => ExitApp())
+
+      ; Gui has no +VScroll option (that is control-only). Use the raw WS_VSCROLL style (0x200000) so the
+      ; non-client scrollbar exists from creation; SetScrollInfo alone adds it without recalculating the frame.
+      this.grid := Gui("-Caption +Parent" g.Hwnd " -DPIScale")
+      this.Dark(this.grid.Hwnd)   ; dark scrollbar
+      this.grid.Show("x0 y" this.S(44) " w" this.S(400) " h" this.S(300) " NoActivate")
+      ; For 2.1 migrate these to this.grid.OnMessage
+      OnMessage(0x000F, this.OnPaint.bind(this))
+      OnMessage(0x0014, this.OnErase.bind(this))
+      OnMessage(0x0115, this.OnVScroll.bind(this))
+      OnMessage(0x0201, this.OnClick.bind(this))
+      this.grid.OnMessage(0x0203, this.CopySel.bind(this)) ; left dbl click
+      this.grid.OnMessage(0x0204, this.CopySel.bind(this)) ; right click
+      g.Show("w" this.S(960) " h" this.S(660))
+      this.InitD2D()
+      this.Layout()
+      this.ShowInfo()
+      this.Render()
+      this.edFilter.Focus()
+      this.grid.opt("+0x200000")
+   }
+
+   ; ---------------------------------------------------------------- dark mode
+
+   /**
+    * Switch the process to force-dark mode via uxtheme ordinal 135 (SetPreferredAppMode).
+    * Undocumented; requires Win10 1903+ and is silently ignored if unavailable.
+    * @returns {unset?}
+    */
+   static InitDark() {
+      ; uxtheme ordinal 135 = SetPreferredAppMode(ForceDark). Undocumented, Win10 1903+/Win11; ignored if absent.
+      try {
+         hMod := DllCall("LoadLibrary", "Str", "uxtheme", "Ptr")
+         DllCall(DllCall("GetProcAddress", "Ptr", hMod, "Ptr", 135, "Ptr"), "Int", 2)
+      }
+   }
+
+   /**
+    * Enable the dark title bar on a top-level window (DWMWA_USE_IMMERSIVE_DARK_MODE, attribute 20, falling back to 19).
+    * @param {Integer} hwnd Window handle
+    * @returns {unset?}
+    */
+   static DarkTitle(hwnd) {   ; DWMWA_USE_IMMERSIVE_DARK_MODE: 20 (Win10 2004+/Win11), 19 (older Win10)
+      for attr in [20, 19] {
+         if !DllCall("dwmapi\DwmSetWindowAttribute", "Ptr", hwnd, "Int", attr, "Int*", 1, "Int", 4, "Int")
+            break
+      }
+   }
+
+   /**
+    * Apply a dark visual theme to a control or window (also gives dark scrollbars).
+    * @param {Integer} hwnd Control or window handle
+    * @param {String} [theme="DarkMode_Explorer"] Theme name passed to SetWindowTheme
+    * @returns {unset?}
+    */
+   static Dark(hwnd, theme := "DarkMode_Explorer") {
+      DllCall("uxtheme\SetWindowTheme", "Ptr", hwnd, "Str", theme, "Ptr", 0)
+   }
+
+   ; ---------------------------------------------------------------- Direct2D
+
+   /**
+    * Builds a D2D1_COLOR_F (4 floats, RGBA) from a 0xRRGGBB value.
+    * @param {Integer|String} rgb Color, 0xRRGGBB or a "RRGGBB" hex string.
+    * @param {Number} [a=1.0] Alpha, 0.0 to 1.0.
+    * @returns {Buffer} 16-byte D2D1_COLOR_F structure.
+    */
+   static _Color(rgb, a := 1.0) {
+      rgb := this._ToRGB(rgb)
+      c := D2D1_COLOR_F()
+      c.r := (rgb >> 16 & 0xFF) / 255
+      c.g := (rgb >> 8 & 0xFF) / 255
+      c.b := (rgb & 0xFF) / 255
+      c.a := a
+      return c
+   }
+      /**
+    * Normalizes a color to an integer 0xRRGGBB.
+    * @param {Integer|String} c An integer, or a hex string such as "A6ADC8" or "0xA6ADC8".
+    * @returns {Integer}
+    */
+   static _ToRGB(c) {
+      if c is Integer
+         return c
+      c := String(c)
+      return Integer(SubStr(c, 1, 2) = "0x" ? c : "0x" c)
+   }
+   /**
+    * Get the client area size of a window.
+    * @param {Integer} hwnd Window handle
+    * @param {VarRef} w Receives the client width in pixels
+    * @param {VarRef} h Receives the client height in pixels
+    * @returns {unset?}
+    */
+   static ClientSize(hwnd, &w, &h) {
+      DllCall("GetClientRect", "Ptr", hwnd, RECT, rc := RECT())
+      w := rc.right, h := rc.bottom
+   }
+
+   /**
+    * Create the Direct2D and DirectWrite factories and the centered, non-wrapping 26-point Segoe UI text format,
+    * then create the render target. Does nothing if already initialized.
+    * @throws {OSError} If a factory cannot be created
+    * @returns {unset?}
+    */
+   static InitD2D() {
+      if this._d2d
+         Return
+
+      iid := Buffer(16)
+      DllCall("ole32\CLSIDFromString", "Str", "{06152247-6F50-465A-9245-118BFD3B6007}", "Ptr", iid)   ; ID2D1Factory
+      hr  := DllCall("d2d1\D2D1CreateFactory", "UInt", 0, "Ptr", iid, "Ptr", 0, "Ptr*", &f := 0, "Int")
+      if hr || !f
+         throw OSError(hr, , "D2D1CreateFactory")
+
+      this._d2d := f
+
+      iid := Buffer(16)
+      DllCall("ole32\CLSIDFromString", "Str", "{B859EE5A-D838-4B5B-A2E8-1ADC7D93DB48}", "Ptr", iid)   ; IDWriteFactory
+      hr := DllCall("dwrite\DWriteCreateFactory", "UInt", 0, "Ptr", iid, "Ptr*", &d:=0, "Int")
+      if hr || !d
+         throw OSError(hr, , "DWriteCreateFactory")
+
+      this._dw := d
+      ; Segoe UI + system font fallback covers symbols and color emoji.
+      this.fmt := D2D.CreateTextFormat(this._dw, "Segoe UI", this.S(26))
+      D2D.SetTextAlignment(this.fmt, 2)        ; center
+      D2D.SetParagraphAlignment(this.fmt, 2)   ; center
+      D2D.SetWordWrapping(this.fmt, 1)         ; no wrap
+      this.MakeRT()
+   }
+
+   /**
+    * Create the HWND render target for the grid window (96 dpi, so 1 DIP = 1 pixel) and its solid color brush.
+    * @returns {unset?}
+    */
+   static MakeRT() {
+      this.ReleaseRT()
+      this.ClientSize(this.grid.Hwnd, &w, &h)
+      props := D2D1_RENDER_TARGET_PROPERTIES()
+      props.dpiX := props.dpiY := 96   ; 1 DIP = 1 pixel
+      hprops := D2D1_HWND_RENDER_TARGET_PROPERTIES()
+      hprops.hwnd := this.grid.Hwnd
+      hprops.pixelSize.width := Max(w, 1)
+      hprops.pixelSize.height := Max(h, 1)
+      this.rt := D2D.CreateHwndRenderTarget(this._d2d, props, hprops)
+      this.br := D2D.CreateSolidColorBrush(this.rt, this.clrGlyph)
+   }
+
+   /**
+    * Draw the visible cells: borders, the selected cell highlight, then the glyphs (color emoji via ENABLE_COLOR_FONT).
+    * If EndDraw fails (device lost) the render target is dropped and Recreate is scheduled.
+    * @returns {unset?}
+    */
+   Static Render() {
+      Static cbRecreate := ObjBindMethod(this, "Recreate")
+
+      If !this.rt
+         Return
+
+      rt := this.rt, br := this.br, fmt := this.fmt, rect := this.rect
+      cw := this.cellW, chh := this.cellH, cols := this.cols, top := this.top
+      n := this.res.Length
+
+      D2D.BeginDraw(rt)
+      D2D.Clear(rt, this.clrBack)
+
+      ; Loop over each character and display in a grid
+      If n {
+         first := top * cols + 1
+         last := Min(n, (top + this.page + 1) * cols)
+         count := last - first + 1
+
+         If count > 0 {
+            ; Initial grid position
+            pos := first - 1
+            col := Mod(pos, cols)
+            row := pos // cols - top
+
+            ; pass 1: cell borders, then the selected cell
+            D2D.SetColor(br, this.clrCellBorder)
+
+            Loop count {
+               rect.left := col * cw + 0.5
+               rect.top := row * chh + 0.5
+               rect.right := (col + 1) * cw - 0.5
+               rect.bottom := (row + 1) * chh - 0.5
+
+               D2D.DrawRectangle(rt, rect, br, 1)
+
+               ; Advance grid position
+               If ++col = cols
+                  col := 0, row++
+            }
+            ; Active selection (if applicable)
+            If this.sel >= first && this.sel <= last {
+               pos := this.sel - 1
+               col := Mod(pos, cols)
+               row := pos // cols - top
+
+               rect.left := col * cw + 0.5
+               rect.top := row * chh + 0.5
+               rect.right := (col + 1) * cw - 0.5
+               rect.bottom := (row + 1) * chh - 0.5
+
+               D2D.SetColor(br, this.clrSelFill)
+               D2D.FillRectangle(rt, rect, br)
+
+               D2D.SetColor(br, this.clrSelBorder)
+               D2D.DrawRectangle(rt, rect, br, 1.5)
+            }
+
+            ; pass 2: glyphs (color glyphs ignore the brush)
+            D2D.SetColor(br, this.clrGlyph)
+
+            ; Reset grid position
+            pos := first - 1
+            col := Mod(pos, cols)
+            row := pos // cols - top
+
+            Loop count {
+               i := first + A_Index - 1
+               e := this.res[i]
+               s := UniData.Ch[e]
+
+               If UniData.Fl[e] & 2
+                  s := Chr(0x25CC) s
+
+               rect.left := col * cw
+               rect.top := row * chh
+               rect.right := (col + 1) * cw
+               rect.bottom := (row + 1) * chh
+
+               ; DrawText: options 6 = CLIP | ENABLE_COLOR_FONT
+               D2D.DrawText(rt, s, fmt, rect, br, 6)
+
+               ; Advance grid position
+               If ++col = cols
+                  col := 0, row++
+            }
+         }
+      }
+
+      If D2D.EndDraw(rt) < 0 {   ; failed (device lost): rebuild and repaint
+         this.ReleaseRT()
+         SetTimer(cbRecreate, -50)
+      }
+   }
+   /**
+    * Release the brush and render target if we have a reset
+    */
+   Static ReleaseRT() {
+      if this.br
+         ObjRelease(this.br)   ; brush first, it belongs to the target
+      if this.rt
+         ObjRelease(this.rt)
+      this.br := this.rt := 0
+   }
+   /**
+    * Rebuild the render target after a device-lost error and repaint.
+    * @returns {unset?}
+    */
+   static Recreate() {
+      this.MakeRT()
+      this.Render()
+   }
+
+   ; ---------------------------------------------------------------- layout / scrolling
+
+   /**
+    * Recalculate columns, rows, page size and cell width from the grid's client size and result count,
+    * clamp the scroll position and update the scrollbar.
+    * @returns {unset?}
+    */
+   static Layout() {
+      this.ClientSize(this.grid.Hwnd, &w, &h)
+      this.cellH := this.S(56)
+      this.cols := Max(1, w // this.S(56))
+      this.cellW := w / this.cols
+      this.rows := Ceil(this.res.Length / this.cols)
+      this.page := Max(1, h // this.cellH)
+      this.top := Max(0, Min(this.top, this.rows - this.page))
+      this.UpdateScroll()
+   }
+
+   /**
+    * Push the current row range, page size and top row to the grid's vertical scrollbar.
+    * @returns {unset?}
+    */
+   static UpdateScroll() {
+      si := Buffer(28, 0)
+      ; SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL (keeps the client width stable)
+      NumPut("UInt", 28, "UInt", 0xF, "Int", 0, "Int", Max(0, this.rows - 1), "UInt", this.page, "Int", this.top, si)
+      DllCall("SetScrollInfo", "Ptr", this.grid.Hwnd, "Int", 1, "Ptr", si, "Int", true)
+   }
+
+   /**
+    * Scroll so row t is the first visible row (clamped), then repaint. No-op if the position is unchanged.
+    * @param {Integer} t Zero-based row index
+    * @returns {unset?}
+    */
+   static ScrollTo(t) {
+      t := Max(0, Min(t, this.rows - this.page))
+      if t = this.top
+         return
+      this.top := t
+      this.UpdateScroll()
+      this.Render()
+   }
+
+   /**
+    * Scroll the grid by mouse wheel, three rows per notch.
+    * @param {Integer} dir -1 to scroll up, 1 to scroll down
+    * @returns {unset?}
+    */
+   static Wheel(dir) {
+      this.ScrollTo(this.top + dir * 3)
+   }
+
+   /**
+    * Check whether the main window is the active window.
+    * @returns {Integer} Non-zero if the main window is active, otherwise 0
+    */
+   static Active() => this.main && WinActive("ahk_id " this.main.Hwnd)
+
+   /**
+    * Move the selection by dx cells / dy rows and scroll it into view. The first key press selects the first
+    * visible cell; moving down from above a short last row lands on the final cell.
+    * @param {Integer} dx Cells to move horizontally
+    * @param {Integer} dy Rows to move vertically
+    * @returns {unset?}
+    */
+   static Nav(dx, dy) {
+      n := this.res.Length
+      if !n
+         return
+      if !this.sel
+         this.sel := Min(n, this.top * this.cols + 1)   ; first key press selects the first visible cell
+      else {
+         s := this.sel + dx + dy * this.cols
+         if s < 1 || s > n {
+            if dy > 0 && Ceil(this.sel / this.cols) < this.rows
+               s := n   ; down from above a short last row: land on the final cell
+            else
+               return
+         }
+         this.sel := s
+      }
+      row := (this.sel - 1) // this.cols
+      if row < this.top
+         this.top := row
+      else if row >= this.top + this.page
+         this.top := row - this.page + 1
+      this.top := Max(0, Min(this.top, this.rows - this.page))
+      this.UpdateScroll()
+      this.ShowInfo()
+      this.Render()
+   }
+
+   /**
+    * Check whether the mouse is over the grid window (used as the #HotIf condition for the wheel hotkeys).
+    * @returns {Boolean}
+    */
+   static OverGrid() {
+      if !this.grid
+         return false
+      MouseGetPos(, , , &h, 2)
+      return h = this.grid.Hwnd
+   }
+
+   /**
+    * Gui Size event: reposition the controls and grid, resize the render target and recalculate the layout.
+    * @param {Gui} gui The main GUI
+    * @param {Integer} minMax -1 minimized, 0 restored, 1 maximized
+    * @param {Integer} w New client width
+    * @param {Integer} h New client height
+    * @returns {unset?}
+    */
+   static OnSize(gui, minMax, w, h) {
+      static renderCB := this.Render.bind(this)
+      if minMax = -1
+         return
+      pad := this.S(8), topH := this.S(44), botH := this.S(72)
+      this.edFilter.Move(pad, pad, w - pad * 3 - this.S(150), this.S(28))
+      this.chkSkin.Move(w - pad - this.S(150), pad + this.S(4), this.S(150))
+      this.grid.Move(0, topH, w, Max(1, h - topH - botH))
+      this.txtInfo.Move(pad, h - botH + this.S(6), w - pad * 3 - this.S(80), botH - this.S(10)) ; got sb here
+      this.btnCopy.Move(w - pad - this.S(80), h - botH + this.S(6), this.S(80), this.S(30))
+      if this.rt {
+         this.ClientSize(this.grid.Hwnd, &gw, &gh)
+         sz := D2D1_SIZE_U()
+         sz.width := Max(gw, 1), sz.height := Max(gh, 1)
+         D2D.Resize(this.rt, sz)
+         this.Layout()
+         ; BUG, Render seems to start some sort of cycle that hangs. Even if on a SetTimer with delay, doesn't seem necessary
+         ; this.Render()
+      }
+   }
+
+   ; ---------------------------------------------------------------- messages
+
+   /**
+    * WM_PAINT handler: repaint the grid and validate its update region.
+    * @param {Integer} wParam Unused
+    * @param {Integer} lParam Unused
+    * @param {Integer} msg Message number
+    * @param {Integer} hwnd Window that received the message
+    * @returns {Integer?} 0 when handled for the grid window, otherwise unset
+    */
+   static OnPaint(wParam, lParam, msg, hwnd) {
+      if hwnd != this.grid.Hwnd
+         return
+      this.Render()
+      DllCall("ValidateRect", "Ptr", hwnd, "Ptr", 0)
+      return 0
+   }
+
+   /**
+    * WM_ERASEBKGND handler: suppress background erase on the grid to avoid flicker.
+    * @param {Integer} wParam Unused
+    * @param {Integer} lParam Unused
+    * @param {Integer} msg Message number
+    * @param {Integer} hwnd Window that received the message
+    * @returns {Integer?} 1 when handled for the grid window, otherwise unset
+    */
+   static OnErase(wParam, lParam, msg, hwnd) {
+      if hwnd = this.grid.Hwnd
+         return 1
+   }
+
+   /**
+    * WM_VSCROLL handler: translate scrollbar actions (line, page, thumb drag, top, bottom) into a scroll.
+    * @param {Integer} wParam Low word = scroll code, high word = thumb position
+    * @param {Integer} lParam Unused
+    * @param {Integer} msg Message number
+    * @param {Integer} hwnd Window that received the message
+    * @returns {Integer?} 0 when handled for the grid window, otherwise unset
+    */
+   static OnVScroll(wParam, lParam, msg, hwnd) {
+      if hwnd != this.grid.Hwnd
+         return
+      code := wParam & 0xFFFF, pos := (wParam >> 16) & 0xFFFF
+      switch code {
+         case 0: t := this.top - 1
+         case 1: t := this.top + 1
+         case 2: t := this.top - this.page
+         case 3: t := this.top + this.page
+         case 4, 5: t := pos
+         case 6: t := 0
+         case 7: t := this.rows
+         default: return 0
+      }
+      this.ScrollTo(t)
+      return 0
+   }
+
+   /**
+    * WM_LBUTTONDOWN handler: select the cell under the cursor and update the info text and display.
+    * @param {Integer} wParam Unused
+    * @param {Integer} lParam Low word = x, high word = y (client coordinates)
+    * @param {Integer} msg Message number
+    * @param {Integer} hwnd Window that received the message
+    * @returns {Integer?} 0 when handled for the grid window, otherwise unset
+    */
+   static OnClick(wParam, lParam, msg, hwnd) {
+      if hwnd != this.grid.Hwnd
+         return
+      x := lParam & 0xFFFF, y := (lParam >> 16) & 0xFFFF
+      idx := (this.top + y // this.cellH) * this.cols + Floor(x / this.cellW) + 1
+      if idx > this.res.Length
+         return 0
+      this.lastIdx := idx, this.lastClick := A_TickCount
+      this.sel := idx
+      this.ShowInfo()
+      this.Render()
+      return 0
+   }
+
+   ; ---------------------------------------------------------------- filter / info
+
+   /**
+    * Filter edit Change event: debounce typing by scheduling Refilter in 150 ms.
+    * @returns {unset?}
+    */
+   static OnFilter(*) {
+      SetTimer(this.tmr, -150)   ; debounce typing
+   }
+
+   /**
+    * Run the search for the current filter text (showing nothing when empty), reset selection and scroll,
+    * then relayout and repaint. Also used as the skin-tone checkbox Click handler.
+    * @returns {unset?}
+    */
+   static Refilter(*) {
+      text := Trim(this.edFilter.Value)
+      this.sel := 0, this.top := 0
+      this.res := text = "" ? [] : UniData.Search(text, this.chkSkin.Value)
+      this.Layout()
+      this.ShowInfo()
+      this.Render()
+   }
+
+   /**
+    * Update the info text: name, code points, group and keywords of the selected entry, or a status message
+    * (prompt, match count, or no matches) when nothing is selected.
+    * @returns {unset?}
+    */
+   static ShowInfo() {
+      if this.sel {
+         i := this.res[this.sel]
+         kw := Trim(UniData.Kw[i])
+         if StrLen(kw) > 140
+            kw := SubStr(kw, 1, 140) "..."
+         grp := UniData.Gr[i] != "" ? "   |   " UniData.Gr[i] : ""
+         this.txtInfo.Value := UniData.Nm[i] "`n" UniData.Hx[i] grp "`n" kw
+      } else if Trim(this.edFilter.Value) = ""
+         this.txtInfo.Value := "Type in the filter box to show characters."
+      else
+         this.txtInfo.Value := this.res.Length ? this.res.Length " matching characters" : "No matches"
+   }
+
+   /**
+    * Copy the selected character (or the first result if none is selected) to the clipboard and show a tooltip.
+    * @returns {unset?}
+    */
+   Static CopyEnter(*) {
+      this.CopySelected()
+   }
+   static CopySel(GuiOrCtrlObj, wParam, lParam, msg) {
+      Switch GuiOrCtrlObj {
+         Case this.grid :
+            this.CopySelected()
+         Default :
+      }
+   }
+   Static CopySelected(*) {
+      if !this.res.Length
+         return
+      i := this.res[this.sel ? this.sel : 1]
+      A_Clipboard := UniData.Ch[i]
+      ToolTip("Copied: " UniData.Nm[i])
+      SetTimer(ToolTip, -1200)
+   }
+}
+
+UniBrowser.Start()
+
+#HotIf UniBrowser.OverGrid()
+WheelUp::UniBrowser.Wheel(-1)
+WheelDown::UniBrowser.Wheel(1)
+#HotIf
+
+; Arrow keys move the selection while the window is active, even with focus in the filter box
+; (Ctrl+Left/Right, Home/End, etc. still edit the filter text).
+#HotIf UniBrowser.Active()
+Left::UniBrowser.Nav(-1, 0)
+Right::UniBrowser.Nav(1, 0)
+Up::UniBrowser.Nav(0, -1)
+Down::UniBrowser.Nav(0, 1)
+#HotIf
+
