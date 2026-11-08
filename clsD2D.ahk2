@@ -14,6 +14,12 @@ struct DWRITE_TEXT_METRICS {
    maxBidiReorderingDepth          : UInt32
    lineCount                       : UInt32
 }
+struct DWRITE_OVERHANG_METRICS {
+   left  : Float32
+   top   : Float32
+   right : Float32
+   bottom: Float32
+}
 struct D2D1_COLOR_F {
    r: Float32
    g: Float32
@@ -358,4 +364,15 @@ class D2D {
       ComCall(60, layout, "Ptr", m)
       return m
    }
+   /**
+    * IDWriteTextLayout::GetOverhangMetrics (vtable 61). Measures the overhang of the bounding box
+    * @param {Integer} layout IDWriteTextLayout pointer.
+    * @returns {DWRITE_TEXT_METRICS} Sizes in DIPs; .width is the natural text width without trailing whitespace.
+    * @throws {OSError} If the call fails.
+    */
+   static GetOverhangMetrics(layout) {
+      m := DWRITE_OVERHANG_METRICS()
+      ComCall(61, layout, "Ptr", m)
+      return m
+   }   
 }
