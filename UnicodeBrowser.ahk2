@@ -281,9 +281,11 @@ class UniBrowser {
    static dpi := 96, sc := 96 / 72, lw := 1, starting := true   ; dpi/sc/lw are set from the active monitor in Start
    static fFilter := 0, fUI := 0                                  ; HFONTs rebuilt on every DPI change
    static ini := A_ScriptDir "\UnicodeBrowser.ini"
-   static main := 0, grid := 0, edFilter := 0, chkSkin := 0, chkBounds := 0, txtInfo := 0, txtMetrics := 0, btnCopy := 0
+   static main := 0, grid := 0, edFilter := 0, btnBack := 0, btnForward := 0
+   static chkSkin := 0, chkBounds := 0, txtInfo := 0, txtMetrics := 0, btnCopy := 0
    static tmr := 0
-   static _d2d := 0, _dw := 0, rt := 0, br := 0, fmt := 0
+   static searchHistory := [], historyPos := 0, navigatingHistory := false
+   static _d2d := 0, _dw := 0, rt := 0, br := 0, fmt := 0, fmtEmoji := 0
    static rect := D2D1_RECT_F()
    ; Grid theme colors as 0xRRGGBB. _Color builds each one once as a D2D1_COLOR_F, ready for the D2D calls.
    static clrBack       := this._Color("0x202020")   ; grid background
@@ -300,6 +302,7 @@ class UniBrowser {
    static FontSize      := 26
    Static BlockSize     := 56
    Static Font          := "Segoe UI"
+   Static EmojiFont     := "Segoe UI Emoji"   ; primary family for emoji-range strings (skips the fallback search)
    /**
     * Scale a 72-dpi design value to the current screen DPI.
     * @param {Number} n Unscaled size
@@ -356,6 +359,8 @@ class UniBrowser {
          , "UInt", 0, "UInt", 1, "UInt", 0, "UInt", 0, "UInt", 5, "UInt", 0, "Str", this.Font, "Ptr")   ; CLEARTYPE_QUALITY
       this.fFilter := mk(14, 700), this.fUI := mk(10, 400)
       SendMessage(0x30, this.fFilter, 1, this.edFilter)   ; WM_SETFONT
+      SendMessage(0x30, this.fFilter, 1, this.btnBack)
+      SendMessage(0x30, this.fFilter, 1, this.btnForward)
       for c in [this.chkSkin, this.chkBounds, this.txtInfo, this.txtMetrics, this.btnCopy]
          SendMessage(0x30, this.fUI, 1, c)
       for f in old
@@ -405,7 +410,11 @@ class UniBrowser {
       g.BackColor := "202020" ; Color
       this.DarkTitle(g.Hwnd)
       g.SetFont("s14 bold cE6E6E6", this.Font)
-      this.edFilter := g.AddEdit("x" this.S(8) " y" this.S(8) " w" this.S(300) " h" this.S(28) " Background2D2D2D")
+      pad := this.S(8), navW := this.S(28), navGap := this.S(3)
+      forwardX := pad + navW + navGap, filterX := pad + 2 * (navW + navGap)
+      this.btnBack := g.AddButton("x" pad " y" pad " w" navW " h" this.S(28) " -Wrap", "◀")
+      this.btnForward := g.AddButton("x" forwardX " y" pad " w" navW " h" this.S(28) " -Wrap", "▶")
+      this.edFilter := g.AddEdit("x" filterX " y" pad " w" this.S(300) " h" this.S(28) " Background2D2D2D")
       SendMessage(0x1501, true, StrPtr("Search name, keyword, group or u+hex"), this.edFilter)   ; EM_SETCUEBANNER
       g.SetFont("s10 Norm cE6E6E6", this.Font)
       this.chkSkin := g.AddCheckbox("x0 y0 w" this.S(100), "Hide skin tones")
@@ -418,10 +427,15 @@ class UniBrowser {
       this.btnCopy := g.AddButton("Default x0 y0 w" this.S(80) " h" this.S(30), "Copy")
       this.ApplyFonts()   ; the SetFont calls above only supply the colors; real sizes come from the monitor DPI
       this.Dark(this.edFilter.Hwnd, "DarkMode_CFD") ; Color
+      this.Dark(this.btnBack.Hwnd) ; Color
+      this.Dark(this.btnForward.Hwnd) ; Color
       this.Dark(this.chkSkin.Hwnd) ; Color
       this.Dark(this.btnCopy.Hwnd) ; Color
       this.Dark(this.chkBounds.Hwnd) ; Color
       this.edFilter.OnEvent("Change", this.OnFilter.Bind(this))
+      this.btnBack.OnEvent("Click", this.NavigateHistory.Bind(this, -1))
+      this.btnForward.OnEvent("Click", this.NavigateHistory.Bind(this, 1))
+      this.UpdateHistoryButtons()
       this.chkSkin.OnEvent("Click", this.Refilter.Bind(this))
       this.btnCopy.OnEvent("Click", this.CopyEnter.Bind(this))
       this.chkBounds.OnEvent("Click", this.OnBounds.Bind(this))
@@ -564,19 +578,38 @@ class UniBrowser {
    }
 
    /**
-    * Create (or recreate after a DPI change) the centered, non-wrapping 26-point Segoe UI text format.
-    * The render target is 96 dpi (1 DIP = 1 pixel), so the size is the DPI-scaled pixel size.
-    * Segoe UI + system font fallback covers symbols and color emoji.
+    * Create (or recreate after a DPI change) the two centered, non-wrapping text formats: the regular font and the
+    * emoji font. The render target is 96 dpi (1 DIP = 1 pixel), so the size is the DPI-scaled pixel size.
     * @returns {unset?}
     */
    static MakeFormat() {
-      if this.fmt
-         ObjRelease(this.fmt)
-      this.fmt := D2D.CreateTextFormat(this._dw, this.Font, this.S(this.FontSize))
-      D2D.SetTextAlignment(this.fmt, 2)        ; center
-      D2D.SetParagraphAlignment(this.fmt, 2)   ; center
-      D2D.SetWordWrapping(this.fmt, 1)         ; no wrap
+      for f in [this.fmt, this.fmtEmoji]
+         if f
+            ObjRelease(f)
+      this.fmt := this.NewFormat(this.Font)
+      this.fmtEmoji := this.NewFormat(this.EmojiFont)
    }
+
+   /**
+    * Create one centered, non-wrapping text format at the current DPI-scaled size.
+    * @param {String} family Font family name
+    * @returns {Integer} IDWriteTextFormat pointer. The caller owns it.
+    */
+   static NewFormat(family) {
+      f := D2D.CreateTextFormat(this._dw, family, this.S(this.FontSize))
+      D2D.SetTextAlignment(f, 2)        ; center
+      D2D.SetParagraphAlignment(f, 2)   ; center
+      D2D.SetWordWrapping(f, 1)         ; no wrap
+      return f
+   }
+
+   /**
+    * Text format for a string: the emoji font for emoji-range characters and sequences (no fallback search),
+    * the regular font for everything else.
+    * @param {String} s The string to be drawn
+    * @returns {Integer} IDWriteTextFormat pointer
+    */
+   static PickFormat(s) => RegExMatch(s, "[\x{1F000}-\x{1FAFF}\x{2600}-\x{27BF}\x{FE0F}\x{200D}]") ? this.fmtEmoji : this.fmt
 
    /**
     * Create the HWND render target for the grid window (96 dpi, so 1 DIP = 1 pixel) and its solid color brush.
@@ -606,7 +639,7 @@ class UniBrowser {
       If !this.rt
          Return
 
-      rt := this.rt, br := this.br, fmt := this.fmt, rect := this.rect, dw := this._dw
+      rt := this.rt, br := this.br, rect := this.rect, dw := this._dw
       cw := this.cellW, chh := this.cellH, cols := this.cols, top := this.top
       showB := this.chkBounds.value, showI := this.showInk
       n := this.res.Length
@@ -679,7 +712,7 @@ class UniBrowser {
                x := col * cw, y := row * chh
 
                ; Same string, format and cell-sized box as before; the layout also supplies the metrics
-               lay := D2D.CreateTextLayout(dw, s, fmt, cw, chh)
+               lay := D2D.CreateTextLayout(dw, s, this.PickFormat(s), cw, chh)
                ; options 6 = CLIP | ENABLE_COLOR_FONT
                D2D.DrawTextLayout(rt, x, y, lay, br, 6)
 
@@ -855,12 +888,15 @@ class UniBrowser {
       if minMax = -1
          return
       pad := this.S(8), topH := this.S(44), botH := this.S(72), mw := this.S(230)
+      navW := this.S(28), navGap := this.S(3), filterX := pad + 2 * (navW + navGap)
       bx := w - pad - this.S(110), sx := bx - this.S(150)
       by := h - botH + this.S(6), bh := botH - this.S(10)
       this.chkSkin.GetPos(, , , &ch)   ; keep the checkboxes' current height
       ; Use deferred batch updates so we don't get controls wiping each other out on resize
       items := [
-         [this.edFilter,   pad, pad, sx - pad * 2, this.S(28)],
+         [this.btnBack,    pad, pad, navW, this.S(28)],
+         [this.btnForward, pad + navW + navGap, pad, navW, this.S(28)],
+         [this.edFilter,   filterX, pad, sx - pad - filterX, this.S(28)],
          [this.chkSkin,    sx, pad + this.S(4), this.S(150), ch],
          [this.chkBounds,  bx, pad + this.S(4), this.S(110), ch],
          [this.grid,       0, topH, w, Max(1, h - topH - botH)],
@@ -902,7 +938,7 @@ class UniBrowser {
       s := UniData.Ch[e]
       if UniData.Fl[e] & 2
          s := Chr(0x25CC) s
-      lay := D2D.CreateTextLayout(this._dw, s, this.fmt, this.cellW, this.cellH)
+      lay := D2D.CreateTextLayout(this._dw, s, this.PickFormat(s), this.cellW, this.cellH)
       m := D2D.GetMetrics(lay)
       D2D.SetMaxWidth(lay, m.widthIncludingTrailingWhitespace)   ; box = the advance
       D2D.SetMaxHeight(lay, m.height)                            ; and the line height
@@ -996,7 +1032,35 @@ class UniBrowser {
     * @returns {unset?}
     */
    static OnFilter(*) {
-      SetTimer(this.tmr, -150)   ; debounce typing
+      if this.navigatingHistory
+         return
+      SetTimer(this.tmr, -200)   ; debounce typing
+   }
+   /**
+    * Clear the filter edit and immediately apply the empty search.
+    * The cleared value is recorded as a history entry, just like clearing it manually.
+    * @returns {unset?}
+    */
+   static ClearFilter(*) {
+      SetTimer(this.tmr, 0)   ; cancel any pending debounced search
+      this.navigatingHistory := true
+      try {
+         this.edFilter.Value := ""
+      } finally {
+         this.navigatingHistory := false
+      }
+      this.RecordHistory("")
+      this.ApplySearch("")
+   }
+
+   /**
+    * Return true only when the filter edit currently owns keyboard focus.
+    * Used to scope Ctrl+Backspace so it does not affect other controls.
+    * @returns {Boolean}
+    */
+   static FilterFocused() {
+      return this.main && WinActive("ahk_id " this.main.Hwnd)
+         && DllCall("GetFocus", "Ptr") = this.edFilter.Hwnd
    }
 
    /**
@@ -1004,13 +1068,82 @@ class UniBrowser {
     * then relayout and repaint. Also used as the skin-tone checkbox Click handler.
     * @returns {unset?}
     */
-   static Refilter(*) { 
+   static Refilter(*) {
       text := Trim(this.edFilter.Value)
+      if !this.navigatingHistory
+         this.RecordHistory(text)
+      this.ApplySearch(text)
+   }
+
+   /**
+    * Apply a search string to the grid, resetting selection and scroll before repainting.
+    * Kept separate from Refilter so history navigation can apply an entry without recording it again.
+    * @param {String} text Search string
+    * @returns {unset?}
+    */
+   static ApplySearch(text) {
       this.sel := 0, this.top := 0
       this.res := text = "" ? [] : UniData.Search(text, this.chkSkin.Value)
       this.Layout()
       this.ShowInfo()
       this.Render()
+   }
+
+   /**
+    * Add a distinct search string to the history. A new search after Back discards the forward branch.
+    * The initial empty search is not stored, but clearing a non-empty history is a valid history entry.
+    * @param {String} text Search string
+    * @returns {unset?}
+    */
+   static RecordHistory(text) {
+      if !this.searchHistory.Length && text = ""
+         return
+      if this.historyPos && this.searchHistory[this.historyPos] = text
+         return
+      while this.searchHistory.Length > this.historyPos
+         this.searchHistory.Pop()
+      this.searchHistory.Push(text)
+      this.historyPos := this.searchHistory.Length
+      this.UpdateHistoryButtons()
+   }
+
+   /**
+    * Navigate backward or forward through previously applied search strings.
+    * A pending edit is committed before navigation, and the target entry is immediately applied.
+    * @param {Integer} direction -1 for Back, 1 for Forward
+    * @returns {unset?}
+    */
+   static NavigateHistory(direction, *) {
+      SetTimer(this.tmr, 0)   ; cancel a pending debounced search
+      text := Trim(this.edFilter.Value)
+      if !this.historyPos || text != this.searchHistory[this.historyPos]
+         this.RecordHistory(text)
+      target := this.historyPos + direction
+      if target < 1 || target > this.searchHistory.Length {
+         this.ApplySearch(text)
+         this.UpdateHistoryButtons()
+         return
+      }
+      this.historyPos := target
+      this.navigatingHistory := true
+      try {
+         this.edFilter.Value := this.searchHistory[target]
+      } finally {
+         this.navigatingHistory := false
+      }
+      this.ApplySearch(this.searchHistory[target])
+      this.UpdateHistoryButtons()
+   }
+
+   /**
+    * Enable Back and Forward only when the corresponding history entries exist.
+    * @returns {unset?}
+    */
+   static UpdateHistoryButtons() {
+      if !this.btnBack
+         return
+      this.btnBack.Enabled := this.historyPos > 1
+      this.btnForward.Enabled := this.historyPos > 0 && this.historyPos < this.searchHistory.Length
    }
    /**
     * User toggled the show bounds check box
@@ -1106,10 +1239,13 @@ WheelDown::UniBrowser.Wheel(1)
 
 ; Arrow keys move the selection while the window is active, even with focus in the filter box
 ; (Ctrl+Left/Right, Home/End, etc. still edit the filter text).
+#HotIf UniBrowser.FilterFocused()
+^Backspace::UniBrowser.ClearFilter()
+#HotIf
+
 #HotIf UniBrowser.Active()
 Left::UniBrowser.Nav(-1, 0)
 Right::UniBrowser.Nav(1, 0)
 Up::UniBrowser.Nav(0, -1)
 Down::UniBrowser.Nav(0, 1)
 #HotIf
-
