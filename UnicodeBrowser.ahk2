@@ -296,7 +296,10 @@ class UniBrowser {
    static res           := [],   sel     := 0, top := 0, cols := 1, rows := 0, page := 1
    static cellW         := 56.0, cellH   := 56
    static lastClick     := 0,    lastIdx := 0
-   static showInk := false
+   static showInk       := false
+   static FontSize      := 26
+   Static BlockSize     := 56
+   Static Font          := "Segoe UI"
    /**
     * Scale a 72-dpi design value to the current screen DPI.
     * @param {Number} n Unscaled size
@@ -350,7 +353,7 @@ class UniBrowser {
    static ApplyFonts() {
       old := [this.fFilter, this.fUI]
       mk := (pt, w) => DllCall("CreateFontW", "Int", -this.S(pt), "Int", 0, "Int", 0, "Int", 0, "Int", w, "UInt", 0, "UInt", 0
-         , "UInt", 0, "UInt", 1, "UInt", 0, "UInt", 0, "UInt", 5, "UInt", 0, "Str", "Segoe UI", "Ptr")   ; CLEARTYPE_QUALITY
+         , "UInt", 0, "UInt", 1, "UInt", 0, "UInt", 0, "UInt", 5, "UInt", 0, "Str", this.Font, "Ptr")   ; CLEARTYPE_QUALITY
       this.fFilter := mk(14, 700), this.fUI := mk(10, 400)
       SendMessage(0x30, this.fFilter, 1, this.edFilter)   ; WM_SETFONT
       for c in [this.chkSkin, this.chkBounds, this.txtInfo, this.txtMetrics, this.btnCopy]
@@ -390,6 +393,9 @@ class UniBrowser {
     * @returns {unset?}
     */
    static Start() {
+      this.FontSize := Max(10, Min(80, Integer(IniRead(this.ini, "Settings", "Font Size", 26))))
+      this.BlockSize := 56 / 26 * this.FontSize
+
       UniData.Load()
       this.tmr := ObjBindMethod(this, "Refilter")
       this.SetDPI(this.GetDPI(0, &hMon))   ; DPI of the monitor the active window is on (not A_ScreenDPI)
@@ -398,15 +404,15 @@ class UniBrowser {
       g := this.main := Gui("+Resize -DPIScale +MinSize" this.S(420) "x" this.S(300), "Unicode Browser")
       g.BackColor := "202020" ; Color
       this.DarkTitle(g.Hwnd)
-      g.SetFont("s14 bold cE6E6E6", "Segoe UI")
+      g.SetFont("s14 bold cE6E6E6", this.Font)
       this.edFilter := g.AddEdit("x" this.S(8) " y" this.S(8) " w" this.S(300) " h" this.S(28) " Background2D2D2D")
       SendMessage(0x1501, true, StrPtr("Search name, keyword, group or u+hex"), this.edFilter)   ; EM_SETCUEBANNER
-      g.SetFont("s10 Norm cE6E6E6", "Segoe UI")
-      this.chkSkin := g.AddCheckbox("x0 y0 w" this.S(150), "Hide skin tones")
+      g.SetFont("s10 Norm cE6E6E6", this.Font)
+      this.chkSkin := g.AddCheckbox("x0 y0 w" this.S(100), "Hide skin tones")
       this.chkSkin.Value := IniRead(this.ini,"Settings","Hide Skin Tones", true)
-      this.chkBounds := g.AddCheckbox("x0 y0 w" this.S(110), "Show bounds")
+      this.chkBounds := g.AddCheckbox("x0 y0 w" this.S(100), "Show bounds")
       this.chkBounds.Value := IniRead(this.ini,"Settings","Show Bounds", true)
-      this.txtInfo := g.AddText("x0 y0 w" this.S(100) " h" this.S(60) " 0x80")   ; SS_NOPREFIX: keep '&'
+      this.txtInfo := g.AddText("x0 y0 w" this.S(75) " h" this.S(60) " 0x80")   ; SS_NOPREFIX: keep '&'
       this.txtInfo.Value := "Please Wait..."
       this.txtMetrics := g.AddText("x0 y0 w" this.S(230) " h" this.S(60) " 0x80")
       this.btnCopy := g.AddButton("Default x0 y0 w" this.S(80) " h" this.S(30), "Copy")
@@ -566,7 +572,7 @@ class UniBrowser {
    static MakeFormat() {
       if this.fmt
          ObjRelease(this.fmt)
-      this.fmt := D2D.CreateTextFormat(this._dw, "Segoe UI", this.S(26))
+      this.fmt := D2D.CreateTextFormat(this._dw, this.Font, this.S(this.FontSize))
       D2D.SetTextAlignment(this.fmt, 2)        ; center
       D2D.SetParagraphAlignment(this.fmt, 2)   ; center
       D2D.SetWordWrapping(this.fmt, 1)         ; no wrap
@@ -742,12 +748,12 @@ class UniBrowser {
     */
    static Layout() {
       this.ClientSize(this.grid.Hwnd, &w, &h)
-      this.cellH := this.S(56)
-      this.cols := Max(1, w // this.S(56))
+      this.cellH := this.S(This.BlockSize)
+      this.cols  := Max(1, w // this.S(this.BlockSize))
       this.cellW := w / this.cols
-      this.rows := Ceil(this.res.Length / this.cols)
-      this.page := Max(1, h // this.cellH)
-      this.top := Max(0, Min(this.top, this.rows - this.page))
+      this.rows  := Ceil(this.res.Length / this.cols)
+      this.page  := Max(1, h // this.cellH)
+      this.top   := Max(0, Min(this.top, this.rows - this.page))
       this.UpdateScroll()
    }
 
@@ -845,25 +851,44 @@ class UniBrowser {
     * @returns {unset?}
     */
    static OnSize(gui, minMax, w, h) {
-      static renderCB := this.Render.bind(this)
+      ; static renderCB := this.Render.bind(this)
       if minMax = -1
          return
-      pad := this.S(8), topH := this.S(44), botH := this.S(72)
+      pad := this.S(8), topH := this.S(44), botH := this.S(72), mw := this.S(230)
       bx := w - pad - this.S(110), sx := bx - this.S(150)
-      this.edFilter.Move(pad, pad, sx - pad * 2, this.S(28))
-      this.chkSkin.Move(sx, pad + this.S(4), this.S(150))
-      this.chkBounds.Move(bx, pad + this.S(4), this.S(110))
-      this.grid.Move(0, topH, w, Max(1, h - topH - botH))
-      mw := this.S(230)
-      this.txtInfo.Move(pad, h - botH + this.S(6), w - pad * 4 - this.S(80) - mw, botH - this.S(10))
-      this.txtMetrics.Move(w - pad * 2 - this.S(80) - mw, h - botH + this.S(6), mw, botH - this.S(10))      
-      this.btnCopy.Move(w - pad - this.S(80), h - botH + this.S(6), this.S(80), this.S(30))
-      if this.rt {
+      by := h - botH + this.S(6), bh := botH - this.S(10)
+      this.chkSkin.GetPos(, , , &ch)   ; keep the checkboxes' current height
+      ; Use deferred batch updates so we don't get controls wiping each other out on resize
+      items := [
+         [this.edFilter,   pad, pad, sx - pad * 2, this.S(28)],
+         [this.chkSkin,    sx, pad + this.S(4), this.S(150), ch],
+         [this.chkBounds,  bx, pad + this.S(4), this.S(110), ch],
+         [this.grid,       0, topH, w, Max(1, h - topH - botH)],
+         [this.txtInfo,    pad, by, w - pad * 4 - this.S(80) - mw, bh],
+         [this.txtMetrics, w - pad * 2 - this.S(80) - mw, by, mw, bh],
+         [this.btnCopy,    w - pad - this.S(80), by, this.S(80), this.S(30)]
+      ]
+
+      hdwp := DllCall("BeginDeferWindowPos", "Int", items.Length, "Ptr")
+      for it in items {
+         if !hdwp
+            break
+         ; The returned handle can change, so always reassign it. 0x14 = SWP_NOZORDER | SWP_NOACTIVATE
+         hdwp := DllCall("DeferWindowPos", "Ptr", hdwp, "Ptr", it[1].Hwnd, "Ptr", 0
+            , "Int", it[2], "Int", it[3], "Int", it[4], "Int", it[5], "UInt", 0x14, "Ptr")
+      }
+      if hdwp
+         DllCall("EndDeferWindowPos", "Ptr", hdwp)
+      else   ; batch failed (the handle is already invalid), fall back to individual moves
+         for it in items
+            it[1].Move(it[2], it[3], it[4], it[5])
+      ; On Resize the internal grid
+      if (this.rt) {
          this.ClientSize(this.grid.Hwnd, &gw, &gh)
          sz := D2D1_SIZE_U()
          sz.width := Max(gw, 1), sz.height := Max(gh, 1)
          D2D.Resize(this.rt, sz)
-         this.Layout()
+         this.Layout() ; this is kinda slow, re-lays out the grid
          ; BUG, Render seems to start some sort of cycle that hangs. Even if on a SetTimer with delay, doesn't seem necessary
          ; this.Render()
       }
@@ -1067,6 +1092,7 @@ class UniBrowser {
          IniWrite(Round(h / this.sc), this.ini, "Window", "Height")
          IniWrite(this.chkBounds.value,this.ini,"Settings","Show Bounds")
          IniWrite(this.chkSkin.value,this.ini,"Settings","Hide Skin Tones")
+         IniWrite(this.FontSize, this.ini, "Settings", "Font Size")
       }
    }   
 }
