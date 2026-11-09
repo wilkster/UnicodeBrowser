@@ -278,7 +278,8 @@ class UniData {
  */
 class UniBrowser {
    static sc := A_ScreenDPI / 72
-   static main := 0, grid := 0, edFilter := 0, chkSkin := 0, txtInfo := 0, txtMetrics := 0, btnCopy := 0
+   static ini := A_ScriptDir "\UnicodeBrowser.ini"
+   static main := 0, grid := 0, edFilter := 0, chkSkin := 0, chkBounds := 0, txtInfo := 0, txtMetrics := 0, btnCopy := 0
    static tmr := 0
    static _d2d := 0, _dw := 0, rt := 0, br := 0, fmt := 0
    static rect := D2D1_RECT_F()
@@ -293,7 +294,7 @@ class UniBrowser {
    static res           := [],   sel     := 0, top := 0, cols := 1, rows := 0, page := 1
    static cellW         := 56.0, cellH   := 56
    static lastClick     := 0,    lastIdx := 0
-   static showBounds    := true, showInk := true
+   static showInk := false
    /**
     * Scale a 72-dpi design value to the current screen DPI.
     * @param {Number} n Unscaled size
@@ -318,7 +319,9 @@ class UniBrowser {
       SendMessage(0x1501, true, StrPtr("Search name, keyword, group or u+hex"), this.edFilter)   ; EM_SETCUEBANNER
       g.SetFont("s10 Norm cE6E6E6", "Segoe UI")
       this.chkSkin := g.AddCheckbox("x0 y0 w" this.S(150), "Hide skin tones")
-      this.chkSkin.Value := true
+      this.chkSkin.Value := IniRead(this.ini,"Settings","Hide Skin Tones", true)
+      this.chkBounds := g.AddCheckbox("x0 y0 w" this.S(110), "Show bounds")
+      this.chkBounds.Value := IniRead(this.ini,"Settings","Show Bounds", true)
       this.txtInfo := g.AddText("x0 y0 w" this.S(100) " h" this.S(60) " 0x80")   ; SS_NOPREFIX: keep '&'
       this.txtInfo.Value := "Please Wait..."
       this.txtMetrics := g.AddText("x0 y0 w" this.S(230) " h" this.S(60) " 0x80")
@@ -326,9 +329,11 @@ class UniBrowser {
       this.Dark(this.edFilter.Hwnd, "DarkMode_CFD") ; Color
       this.Dark(this.chkSkin.Hwnd) ; Color
       this.Dark(this.btnCopy.Hwnd) ; Color
+      this.Dark(this.chkBounds.Hwnd) ; Color
       this.edFilter.OnEvent("Change", this.OnFilter.Bind(this))
       this.chkSkin.OnEvent("Click", this.Refilter.Bind(this))
       this.btnCopy.OnEvent("Click", this.CopyEnter.Bind(this))
+      this.chkBounds.OnEvent("Click", this.OnBounds.Bind(this))
       g.OnEvent("Size", this.OnSize.Bind(this))
       g.OnEvent("Close", (*) => ExitApp())
 
@@ -344,13 +349,14 @@ class UniBrowser {
       OnMessage(0x0201, this.OnClick.bind(this))
       this.grid.OnMessage(0x0203, this.CopySel.bind(this)) ; left dbl click
       this.grid.OnMessage(0x0204, this.CopySel.bind(this)) ; right click
-      g.Show("w" this.S(960) " h" this.S(660))
+      g.Show("w" this.LoadDim("Width", 960, this.S(420)) " h" this.LoadDim("Height", 660, this.S(300)))
       this.InitD2D()
       this.Layout()
       this.ShowInfo()
       this.Render()
       this.edFilter.Focus()
       this.grid.opt("+0x200000")
+      OnExit(this.SaveSize.Bind(this))
    }
 
    ; ---------------------------------------------------------------- dark mode
@@ -493,7 +499,7 @@ class UniBrowser {
 
       rt := this.rt, br := this.br, fmt := this.fmt, rect := this.rect, dw := this._dw
       cw := this.cellW, chh := this.cellH, cols := this.cols, top := this.top
-      showB := this.showBounds, showI := this.showInk
+      showB := this.chkBounds.value, showI := this.showInk
       n := this.res.Length
 
       D2D.BeginDraw(rt)
@@ -604,100 +610,6 @@ class UniBrowser {
          SetTimer(cbRecreate, -50)
       }
    }   
-   ; Static Render() {
-   ;    Static cbRecreate := ObjBindMethod(this, "Recreate")
-
-   ;    If !this.rt
-   ;       Return
-
-   ;    rt := this.rt, br := this.br, fmt := this.fmt, rect := this.rect
-   ;    cw := this.cellW, chh := this.cellH, cols := this.cols, top := this.top
-   ;    n := this.res.Length
-
-   ;    D2D.BeginDraw(rt)
-   ;    D2D.Clear(rt, this.clrBack)
-
-   ;    ; Loop over each character and display in a grid
-   ;    If n {
-   ;       first := top * cols + 1
-   ;       last := Min(n, (top + this.page + 1) * cols)
-   ;       count := last - first + 1
-
-   ;       If count > 0 {
-   ;          ; Initial grid position
-   ;          pos := first - 1
-   ;          col := Mod(pos, cols)
-   ;          row := pos // cols - top
-
-   ;          ; pass 1: cell borders, then the selected cell
-   ;          D2D.SetColor(br, this.clrCellBorder)
-
-   ;          Loop count {
-   ;             rect.left := col * cw + 0.5
-   ;             rect.top := row * chh + 0.5
-   ;             rect.right := (col + 1) * cw - 0.5
-   ;             rect.bottom := (row + 1) * chh - 0.5
-
-   ;             D2D.DrawRectangle(rt, rect, br, 1)
-
-   ;             ; Advance grid position
-   ;             If ++col = cols
-   ;                col := 0, row++
-   ;          }
-   ;          ; Active selection (if applicable)
-   ;          If this.sel >= first && this.sel <= last {
-   ;             pos := this.sel - 1
-   ;             col := Mod(pos, cols)
-   ;             row := pos // cols - top
-
-   ;             rect.left := col * cw + 0.5
-   ;             rect.top := row * chh + 0.5
-   ;             rect.right := (col + 1) * cw - 0.5
-   ;             rect.bottom := (row + 1) * chh - 0.5
-
-   ;             D2D.SetColor(br, this.clrSelFill)
-   ;             D2D.FillRectangle(rt, rect, br)
-
-   ;             D2D.SetColor(br, this.clrSelBorder)
-   ;             D2D.DrawRectangle(rt, rect, br, 1.5)
-   ;          }
-
-   ;          ; pass 2: glyphs (color glyphs ignore the brush)
-   ;          D2D.SetColor(br, this.clrGlyph)
-
-   ;          ; Reset grid position
-   ;          pos := first - 1
-   ;          col := Mod(pos, cols)
-   ;          row := pos // cols - top
-
-   ;          Loop count {
-   ;             i := first + A_Index - 1
-   ;             e := this.res[i]
-   ;             s := UniData.Ch[e]
-
-   ;             If UniData.Fl[e] & 2
-   ;                s := Chr(0x25CC) s
-
-   ;             rect.left := col * cw
-   ;             rect.top := row * chh
-   ;             rect.right := (col + 1) * cw
-   ;             rect.bottom := (row + 1) * chh
-
-   ;             ; DrawText: options 6 = CLIP | ENABLE_COLOR_FONT
-   ;             D2D.DrawText(rt, s, fmt, rect, br, 6)
-
-   ;             ; Advance grid position
-   ;             If ++col = cols
-   ;                col := 0, row++
-   ;          }
-   ;       }
-   ;    }
-
-   ;    If D2D.EndDraw(rt) < 0 {   ; failed (device lost): rebuild and repaint
-   ;       this.ReleaseRT()
-   ;       SetTimer(cbRecreate, -50)
-   ;    }
-   ; }
    /**
     * Release the brush and render target if we have a reset
     */
@@ -833,8 +745,10 @@ class UniBrowser {
       if minMax = -1
          return
       pad := this.S(8), topH := this.S(44), botH := this.S(72)
-      this.edFilter.Move(pad, pad, w - pad * 3 - this.S(150), this.S(28))
-      this.chkSkin.Move(w - pad - this.S(150), pad + this.S(4), this.S(150))
+      bx := w - pad - this.S(110), sx := bx - this.S(150)
+      this.edFilter.Move(pad, pad, sx - pad * 2, this.S(28))
+      this.chkSkin.Move(sx, pad + this.S(4), this.S(150))
+      this.chkBounds.Move(bx, pad + this.S(4), this.S(110))
       this.grid.Move(0, topH, w, Max(1, h - topH - botH))
       mw := this.S(230)
       this.txtInfo.Move(pad, h - botH + this.S(6), w - pad * 4 - this.S(80) - mw, botH - this.S(10))
@@ -969,7 +883,13 @@ class UniBrowser {
       this.ShowInfo()
       this.Render()
    }
-
+   /**
+    * User toggled the show bounds check box
+    * @returns {unset?}
+    */
+   static OnBounds(*) {
+      this.Render()
+   }
    /**
     * Update the info text: name, code points, group and keywords of the selected entry, or a status message
     * (prompt, match count, or no matches) when nothing is selected.
@@ -1018,6 +938,33 @@ class UniBrowser {
       ToolTip("Copied: " UniData.Nm[i])
       SetTimer(ToolTip, -1200)
    }
+   /**
+    * Read a saved client dimension (pixels) from the ini; fall back to the scaled default if missing or too small.
+    * @param {String} key "Width" or "Height"
+    * @param {Integer} def Unscaled 72-dpi default
+    * @param {Integer} min Smallest accepted pixel value
+    * @returns {Integer}
+    */
+   static LoadDim(key, def, min) {
+      v := IniRead(this.ini, "Window", key, "")
+      return IsInteger(v) && this.S(v) >= min ? this.S(v) : this.S(def)
+   }
+
+   /**
+    * OnExit handler: save the client size to the ini. Skipped while minimized or maximized so the
+    * last normal size is kept.
+    */
+   static SaveSize(*) {
+      try {
+         if WinGetMinMax(this.main.Hwnd) != 0
+            return
+         WinGetClientPos(, , &w, &h, this.main.Hwnd)
+         IniWrite(Round(w / this.sc), this.ini, "Window", "Width")
+         IniWrite(Round(h / this.sc), this.ini, "Window", "Height")
+         IniWrite(this.chkBounds.value,this.ini,"Settings","Show Bounds")
+         IniWrite(this.chkSkin.value,this.ini,"Settings","Hide Skin Tones")
+      }
+   }   
 }
 
 UniBrowser.Start()
