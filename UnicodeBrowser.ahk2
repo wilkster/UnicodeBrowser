@@ -885,8 +885,10 @@ class UniBrowser {
     */
    static OnSize(gui, minMax, w, h) {
       ; static renderCB := this.Render.bind(this)
-      if minMax = -1
-         return
+      If minMax = -1 {
+         DllCall("psapi\EmptyWorkingSet", "ptr", -1)
+         Return
+      }
       pad := this.S(8), topH := this.S(44), botH := this.S(72), mw := this.S(230)
       navW := this.S(28), navGap := this.S(3), filterX := pad + 2 * (navW + navGap)
       bx := w - pad - this.S(110), sx := bx - this.S(150)
