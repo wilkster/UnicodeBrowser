@@ -12,6 +12,7 @@
 #DllLoad "d2d1.dll"
 #DllLoad "dwrite.dll"
 #Include "clsD2D.ahk2"
+try DllCall("SetProcessDpiAwarenessContext", "Ptr", -4, "Ptr")   ; PER_MONITOR_AWARE_V2; fails harmlessly if already set
 TraySetIcon(A_ScriptDir "\tray.ico")
 ; Unicode / emoji browser
 ; - One Direct2D HwndRenderTarget draws the visible cells only (virtual grid), so
@@ -277,7 +278,8 @@ class UniData {
  * cols/rows/page = grid geometry, cellW/cellH = cell size in pixels.
  */
 class UniBrowser {
-   static sc := A_ScreenDPI / 72
+   static dpi := 96, sc := 96 / 72, lw := 1, starting := true   ; dpi/sc/lw are set from the active monitor in Start
+   static fFilter := 0, fUI := 0                                  ; HFONTs rebuilt on every DPI change
    static ini := A_ScriptDir "\UnicodeBrowser.ini"
    static main := 0, grid := 0, edFilter := 0, chkSkin := 0, chkBounds := 0, txtInfo := 0, txtMetrics := 0, btnCopy := 0
    static tmr := 0
@@ -303,12 +305,94 @@ class UniBrowser {
    static S(n) => Round(n * this.sc)
 
    /**
+    * Effective DPI of the monitor a window is on (the active window's monitor when hwnd is 0).
+    * Falls back to the primary monitor, then to A_ScreenDPI.
+    * @param {Integer} [hwnd=0] Window handle
+    * @param {VarRef} [hMon] Receives the monitor handle
+    * @returns {Integer}
+    */
+   static GetDPI(hwnd := 0, &hMon := 0) {
+      hMon := DllCall("MonitorFromWindow", "Ptr", hwnd || WinExist("A"), "UInt", 1, "Ptr")   ; MONITOR_DEFAULTTOPRIMARY
+      try {
+         if !DllCall("shcore\GetDpiForMonitor", "Ptr", hMon, "Int", 0, "UInt*", &dx := 0, "UInt*", &dy := 0, "Int")   ; MDT_EFFECTIVE_DPI
+            return dx
+      }
+      return A_ScreenDPI
+   }
+
+   /**
+    * Store the DPI and derive the 72-dpi scale factor and the D2D stroke width (whole pixels) from it.
+    * @param {Integer} dpi
+    * @returns {unset?}
+    */
+   static SetDPI(dpi) {
+      this.dpi := dpi, this.sc := dpi / 72
+      this.lw := Max(1, dpi // 96)
+   }
+
+   /**
+    * Work area of a monitor.
+    * @param {Integer} hMon Monitor handle
+    * @returns {Object} {l, t, r, b} in virtual-screen pixels
+    */
+   static MonitorWork(hMon) {
+      mi := Buffer(40, 0)
+      NumPut("UInt", 40, mi)
+      DllCall("GetMonitorInfoW", "Ptr", hMon, "Ptr", mi)
+      return {l: NumGet(mi, 20, "Int"), t: NumGet(mi, 24, "Int"), r: NumGet(mi, 28, "Int"), b: NumGet(mi, 32, "Int")}
+   }
+
+   /**
+    * (Re)create the UI fonts at the current DPI and apply them to the controls. Sizes are in points, so
+    * pixel height = pt * dpi / 72. Old fonts are deleted after the controls switch over.
+    * @returns {unset?}
+    */
+   static ApplyFonts() {
+      old := [this.fFilter, this.fUI]
+      mk := (pt, w) => DllCall("CreateFontW", "Int", -this.S(pt), "Int", 0, "Int", 0, "Int", 0, "Int", w, "UInt", 0, "UInt", 0
+         , "UInt", 0, "UInt", 1, "UInt", 0, "UInt", 0, "UInt", 5, "UInt", 0, "Str", "Segoe UI", "Ptr")   ; CLEARTYPE_QUALITY
+      this.fFilter := mk(14, 700), this.fUI := mk(10, 400)
+      SendMessage(0x30, this.fFilter, 1, this.edFilter)   ; WM_SETFONT
+      for c in [this.chkSkin, this.chkBounds, this.txtInfo, this.txtMetrics, this.btnCopy]
+         SendMessage(0x30, this.fUI, 1, c)
+      for f in old
+         if f
+            DllCall("DeleteObject", "Ptr", f)
+   }
+
+   /**
+    * WM_DPICHANGED handler: the window moved to a monitor with a different DPI. Rescale fonts, the D2D text
+    * format and the window (to the system-suggested rectangle); Size/Layout/Render follow from the resize.
+    * During Start the suggested rectangle is ignored because Start already sized the window for this DPI.
+    * @param {Gui} gui Main GUI
+    * @param {Integer} wParam Low word = new DPI
+    * @param {Integer} lParam Pointer to the suggested window RECT
+    * @param {Integer} msg Message number
+    * @returns {Integer} 0
+    */
+   static OnDpiChanged(gui, wParam, lParam, msg) {
+      this.SetDPI(wParam & 0xFFFF)
+      this.main.Opt("+MinSize" this.S(420) "x" this.S(300))
+      this.ApplyFonts()
+      if this.fmt
+         this.MakeFormat()
+      if !this.starting {
+         x := NumGet(lParam, 0, "Int"), y := NumGet(lParam, 4, "Int")
+         DllCall("SetWindowPos", "Ptr", gui.Hwnd, "Ptr", 0, "Int", x, "Int", y
+            , "Int", NumGet(lParam, 8, "Int") - x, "Int", NumGet(lParam, 12, "Int") - y, "UInt", 0x14)   ; NOZORDER | NOACTIVATE
+         this.ShowInfo()   ; refresh the metrics text and repaint with the new format
+      }
+      return 0
+   }
+
+   /**
     * Load the data, build the GUI and grid window, register message handlers and show the window.
     * @returns {unset?}
     */
    static Start() {
       UniData.Load()
       this.tmr := ObjBindMethod(this, "Refilter")
+      this.SetDPI(this.GetDPI(0, &hMon))   ; DPI of the monitor the active window is on (not A_ScreenDPI)
 
       this.InitDark() ; Color
       g := this.main := Gui("+Resize -DPIScale +MinSize" this.S(420) "x" this.S(300), "Unicode Browser")
@@ -326,6 +410,7 @@ class UniBrowser {
       this.txtInfo.Value := "Please Wait..."
       this.txtMetrics := g.AddText("x0 y0 w" this.S(230) " h" this.S(60) " 0x80")
       this.btnCopy := g.AddButton("Default x0 y0 w" this.S(80) " h" this.S(30), "Copy")
+      this.ApplyFonts()   ; the SetFont calls above only supply the colors; real sizes come from the monitor DPI
       this.Dark(this.edFilter.Hwnd, "DarkMode_CFD") ; Color
       this.Dark(this.chkSkin.Hwnd) ; Color
       this.Dark(this.btnCopy.Hwnd) ; Color
@@ -335,6 +420,7 @@ class UniBrowser {
       this.btnCopy.OnEvent("Click", this.CopyEnter.Bind(this))
       this.chkBounds.OnEvent("Click", this.OnBounds.Bind(this))
       g.OnEvent("Size", this.OnSize.Bind(this))
+      g.OnMessage(0x02E0, this.OnDpiChanged.Bind(this))   ; WM_DPICHANGED
       g.OnEvent("Close", (*) => ExitApp())
 
       ; Gui has no +VScroll option (that is control-only). Use the raw WS_VSCROLL style (0x200000) so the
@@ -349,7 +435,12 @@ class UniBrowser {
       OnMessage(0x0201, this.OnClick.bind(this))
       this.grid.OnMessage(0x0203, this.CopySel.bind(this)) ; left dbl click
       this.grid.OnMessage(0x0204, this.CopySel.bind(this)) ; right click
-      g.Show("w" this.LoadDim("Width", 960, this.S(420)) " h" this.LoadDim("Height", 660, this.S(300)))
+      ; Create the window on the active monitor (hidden), then center it in that monitor's work area
+      w := this.LoadDim("Width", 960, this.S(420)), h := this.LoadDim("Height", 660, this.S(300))
+      wa := this.MonitorWork(hMon)
+      g.Show("Hide x" wa.l " y" wa.t " w" w " h" h)
+      WinGetPos(, , &ww, &wh, g.Hwnd)
+      g.Show("x" wa.l + (wa.r - wa.l - ww) // 2 " y" wa.t + (wa.b - wa.t - wh) // 2)
       this.InitD2D()
       this.Layout()
       this.ShowInfo()
@@ -357,6 +448,7 @@ class UniBrowser {
       this.edFilter.Focus()
       this.grid.opt("+0x200000")
       OnExit(this.SaveSize.Bind(this))
+      this.starting := false
    }
 
    ; ---------------------------------------------------------------- dark mode
@@ -461,12 +553,23 @@ class UniBrowser {
          throw OSError(hr, , "DWriteCreateFactory")
 
       this._dw := d
-      ; Segoe UI + system font fallback covers symbols and color emoji.
+      this.MakeFormat()
+      this.MakeRT()
+   }
+
+   /**
+    * Create (or recreate after a DPI change) the centered, non-wrapping 26-point Segoe UI text format.
+    * The render target is 96 dpi (1 DIP = 1 pixel), so the size is the DPI-scaled pixel size.
+    * Segoe UI + system font fallback covers symbols and color emoji.
+    * @returns {unset?}
+    */
+   static MakeFormat() {
+      if this.fmt
+         ObjRelease(this.fmt)
       this.fmt := D2D.CreateTextFormat(this._dw, "Segoe UI", this.S(26))
       D2D.SetTextAlignment(this.fmt, 2)        ; center
       D2D.SetParagraphAlignment(this.fmt, 2)   ; center
       D2D.SetWordWrapping(this.fmt, 1)         ; no wrap
-      this.MakeRT()
    }
 
    /**
@@ -501,6 +604,7 @@ class UniBrowser {
       cw := this.cellW, chh := this.cellH, cols := this.cols, top := this.top
       showB := this.chkBounds.value, showI := this.showInk
       n := this.res.Length
+      lw := this.lw, hf := lw / 2   ; stroke width and half-pixel offset, in whole device pixels
 
       D2D.BeginDraw(rt)
       D2D.Clear(rt, this.clrBack)
@@ -521,12 +625,12 @@ class UniBrowser {
             D2D.SetColor(br, this.clrCellBorder)
 
             Loop count {
-               rect.left := col * cw + 0.5
-               rect.top := row * chh + 0.5
-               rect.right := (col + 1) * cw - 0.5
-               rect.bottom := (row + 1) * chh - 0.5
+               rect.left := col * cw + hf
+               rect.top := row * chh + hf
+               rect.right := (col + 1) * cw - hf
+               rect.bottom := (row + 1) * chh - hf
 
-               D2D.DrawRectangle(rt, rect, br, 1)
+               D2D.DrawRectangle(rt, rect, br, lw)
 
                ; Advance grid position
                If ++col = cols
@@ -538,16 +642,16 @@ class UniBrowser {
                col := Mod(pos, cols)
                row := pos // cols - top
 
-               rect.left := col * cw + 0.5
-               rect.top := row * chh + 0.5
-               rect.right := (col + 1) * cw - 0.5
-               rect.bottom := (row + 1) * chh - 0.5
+               rect.left := col * cw + hf
+               rect.top := row * chh + hf
+               rect.right := (col + 1) * cw - hf
+               rect.bottom := (row + 1) * chh - hf
 
                D2D.SetColor(br, this.clrSelFill)
                D2D.FillRectangle(rt, rect, br)
 
                D2D.SetColor(br, this.clrSelBorder)
-               D2D.DrawRectangle(rt, rect, br, 1.5)
+               D2D.DrawRectangle(rt, rect, br, lw * 1.5)
             }
 
             ; pass 2: glyphs (color glyphs ignore the brush), each followed by its optional outlines
@@ -581,7 +685,7 @@ class UniBrowser {
                   rect.right := rect.left + m.widthIncludingTrailingWhitespace
                   rect.bottom := rect.top + m.height
                   D2D.SetColor(br, this.clrBounds)
-                  D2D.DrawRectangle(rt, rect, br, 1)
+                  D2D.DrawRectangle(rt, rect, br, lw)
                }
                If showI {
                   ; Ink box: overhang is relative to the layout box (the cell), so expand the cell by it
@@ -591,7 +695,7 @@ class UniBrowser {
                   rect.right := x + cw + o.right
                   rect.bottom := y + chh + o.bottom
                   D2D.SetColor(br, this.clrInk)
-                  D2D.DrawRectangle(rt, rect, br, 1)
+                  D2D.DrawRectangle(rt, rect, br, lw)
                }
                If showB || showI
                   D2D.SetColor(br, this.clrGlyph)
