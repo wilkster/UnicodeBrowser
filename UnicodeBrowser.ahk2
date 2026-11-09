@@ -435,6 +435,7 @@ class UniBrowser {
       this.edFilter.OnEvent("Change", this.OnFilter.Bind(this))
       this.btnBack.OnEvent("Click", this.NavigateHistory.Bind(this, -1))
       this.btnForward.OnEvent("Click", this.NavigateHistory.Bind(this, 1))
+      this.txtInfo.OnEvent("Click", this.getInfo.Bind(this))
       this.UpdateHistoryButtons()
       this.chkSkin.OnEvent("Click", this.Refilter.Bind(this))
       this.btnCopy.OnEvent("Click", this.CopyEnter.Bind(this))
@@ -1179,7 +1180,19 @@ class UniBrowser {
          this.txtMetrics.Value := ""
       }
    }
-
+   /**
+    * Copy the next code for the seleced character into the clipboard
+    * @param GuiOrCtrlObj Gui control
+    * @returns {unset?} 
+    */
+   Static getInfo(GuiOrCtrlObj,*) {
+      If this.sel {
+         i := this.res[this.sel]
+         A_Clipboard := UniData.Hx[i]
+         ToolTip("Copied " A_Clipboard " to clipboard")
+         SetTimer(ToolTip, -1200)
+      }
+   }
    /**
     * Copy the selected character (or the first result if none is selected) to the clipboard and show a tooltip.
     * @returns {unset?}
