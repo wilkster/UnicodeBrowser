@@ -1,5 +1,5 @@
-;@Ahk2Exe-SetName UnicodeBrowser
-;@Ahk2Exe-SetDescription UnicodeBrowser
+;@Ahk2Exe-SetName Unicode Browser
+;@Ahk2Exe-SetDescription Unicode Browser
 ;@Ahk2Exe-Set Comments, Unicode and Emoji Browser
 ;@Ahk2Exe-SetVersion 2026.10.12
 ;@Ahk2Exe-SetCopyright Copyright (c) 2026 Tom Wilkason
@@ -27,9 +27,7 @@ TraySetIcon(A_ScriptDir "\tray.ico")
 ;   A term starting with "u+" matches code points, e.g.  u+1f60   or   arrow u+219
 ; - Click selects, double-click or Enter copies. Mouse wheel scrolls over the grid.
 /* TODO
- * x OnMessage should be changed to Gui.OnMessage for the grid only
- * x this.Cf(58, 58, 58) => Make thes part of a theme and as fixed   (grid colors are now the clr* properties; Start() colors are still hard coded)
- * x Wrap the ComCalls in descriptive names ComCall(27,,,,) > DrawText(...)   (see D2D.ahk2)
+ * 
 */
 
 /**
@@ -45,11 +43,11 @@ struct RECT {
    right : Int32
    bottom: Int32
 }
-class UniData {
-   static Dir := A_ScriptDir "\UnicodeData"
-   static Ch := [], Nm := [], Gr := [], Kw := [], Hx := [], Fl := [], Sr := []
-   static Idx := Map()
-   static VS16 := Chr(0xFE0F)
+Class UniData {
+   Static Dir := A_ScriptDir "\UnicodeData"
+   Static Ch := [], Nm := [], Gr := [], Kw := [], Hx := [], Fl := [], Sr := []
+   Static Idx := Map()
+   Static VS16 := Chr(0xFE0F)
 
    ; Fl bit 1 = skin-tone variant, bit 2 = combining mark (drawn on a dotted circle)
 
@@ -59,7 +57,7 @@ class UniData {
     * @throws {Error} If a required data file cannot be downloaded
     * @returns {unset?}
     */
-   static Load() {
+   Static Load() {
       DirCreate(this.Dir)
       ToolTip("Loading Unicode data (first run downloads ~4 MB)...")
       ucd := "https://www.unicode.org/Public/UCD/latest/ucd/"
@@ -74,8 +72,8 @@ class UniData {
 
       this.LoadEmoji(fEmoji)
       this.LoadUnicodeData(fUni, fBlk)
-      for f in [fAnn, fDer] {
-         if f != ""
+      For f in [fAnn, fDer] {
+         If f != ""
             this.ApplyAnnotations(f)
       }
       Loop this.Ch.Length {
@@ -93,18 +91,18 @@ class UniData {
     * @throws {Error} If the download fails and required is true
     * @returns {String} Full path of the cached file, or "" if an optional download failed
     */
-   static Fetch(name, url, required := true) {
+   Static Fetch(name, url, required := true) {
       f := this.Dir "\" name
-      if FileExist(f) && FileGetSize(f) > 0
-         return f
+      If FileExist(f) && FileGetSize(f) > 0
+         Return f
       hr := DllCall("urlmon\URLDownloadToFileW", "Ptr", 0, "Str", url, "Str", f, "UInt", 0, "Ptr", 0, "UInt")
-      if hr != 0 || !FileExist(f) || FileGetSize(f) = 0 {
-         try FileDelete(f)
-         if required
-            throw Error("Download failed: " url)
-         return ""
+      If hr != 0 || !FileExist(f) || FileGetSize(f) = 0 {
+         Try FileDelete(f)
+         If required
+            Throw Error("Download failed: " url)
+         Return ""
       }
-      return f
+      Return f
    }
 
    /**
@@ -117,7 +115,7 @@ class UniData {
     * @param {Integer} fl Flag bits: 1 = skin-tone variant, 2 = combining mark
     * @returns {unset?}
     */
-   static Add(key, ch, name, group, hx, fl) {
+   Static Add(key, ch, name, group, hx, fl) {
       this.Ch.Push(ch)
       this.Nm.Push(name)
       this.Gr.Push(group)
@@ -133,25 +131,25 @@ class UniData {
     * @param {String} file Path to emoji-test.txt
     * @returns {unset?}
     */
-   static LoadEmoji(file) {
+   Static LoadEmoji(file) {
       group := ""
-      for line in StrSplit(FileRead(file, "UTF-8"), "`n", "`r") {
-         if line = ""
-            continue
-         if SubStr(line, 1, 1) = "#" {
-            if RegExMatch(line, "^# group: (.+)$", &g)
+      For line in StrSplit(FileRead(file, "UTF-8"), "`n", "`r") {
+         If line = ""
+            Continue
+         If SubStr(line, 1, 1) = "#" {
+            If RegExMatch(line, "^# group: (.+)$", &g)
                group := g[1]
-            continue
+            Continue
          }
-         if !RegExMatch(line, "^([0-9A-F]+(?: [0-9A-F]+)*)\s*;\s*(\S+)\s*#\s*\S+\s+E[\d.]+\s+(.+)$", &m)
+         If !RegExMatch(line, "^([0-9A-F]+(?: [0-9A-F]+)*)\s*;\s*(\S+)\s*#\s*\S+\s+E[\d.]+\s+(.+)$", &m)
             || m[2] != "fully-qualified"
-            continue
+            Continue
          s := "", hx := "", fl := 0
-         for h in StrSplit(m[1], " ") {
+         For h in StrSplit(m[1], " ") {
             cp := Integer("0x" h)
             s .= Chr(cp)
             hx .= (hx = "" ? "" : " ") . Format("U+{:04X}", cp)
-            if cp >= 0x1F3FB && cp <= 0x1F3FF
+            If cp >= 0x1F3FB && cp <= 0x1F3FF
                fl |= 1
          }
          this.Add(StrReplace(s, this.VS16), s, m[3], group, hx, fl)
@@ -166,11 +164,11 @@ class UniData {
     * @param {String} blkFile Path to Blocks.txt, or "" to leave the group blank
     * @returns {unset?}
     */
-   static LoadUnicodeData(file, blkFile) {
+   Static LoadUnicodeData(file, blkFile) {
       bLo := [], bHi := [], bNm := []
-      if blkFile != "" {
-         for line in StrSplit(FileRead(blkFile, "UTF-8"), "`n", "`r") {
-            if RegExMatch(line, "^([0-9A-F]+)\.\.([0-9A-F]+);\s*(.+)$", &b) {
+      If blkFile != "" {
+         For line in StrSplit(FileRead(blkFile, "UTF-8"), "`n", "`r") {
+            If RegExMatch(line, "^([0-9A-F]+)\.\.([0-9A-F]+);\s*(.+)$", &b) {
                bLo.Push(Integer("0x" b[1]))
                bHi.Push(Integer("0x" b[2]))
                bNm.Push(Trim(b[3]))
@@ -179,23 +177,23 @@ class UniData {
       }
       bi := 1
       Loop Parse FileRead(file, "UTF-8"), "`n", "`r" {
-         if !RegExMatch(A_LoopField, "^([0-9A-F]+);([^;]*);(\w\w);", &m)
-            continue
+         If !RegExMatch(A_LoopField, "^([0-9A-F]+);([^;]*);(\w\w);", &m)
+            Continue
          name := m[2], cat := m[3]
-         if SubStr(name, 1, 1) = "<" || SubStr(cat, 1, 1) = "C"
-            continue   ; ranges, controls, format, private use, surrogates
+         If SubStr(name, 1, 1) = "<" || SubStr(cat, 1, 1) = "C"
+            Continue   ; ranges, controls, format, private use, surrogates
          cp := Integer("0x" m[1])
          ch := Chr(cp)
-         if this.Idx.Has(ch) {
+         If this.Idx.Has(ch) {
             ; already added from emoji-test: keep its short name, add the formal name as a keyword
             this.Kw[this.Idx[ch]] .= " " StrTitle(name)
-            continue
+            Continue
          }
          group := ""
-         if bNm.Length {
-            while bi < bNm.Length && cp > bHi[bi]
+         If bNm.Length {
+            While bi < bNm.Length && cp > bHi[bi]
                bi++
-            if cp >= bLo[bi] && cp <= bHi[bi]
+            If cp >= bLo[bi] && cp <= bHi[bi]
                group := bNm[bi]
          }
          this.Add(ch, ch, StrTitle(name), group, Format("U+{:04X}", cp), SubStr(cat, 1, 1) = "M" ? 2 : 0)
@@ -208,17 +206,17 @@ class UniData {
     * @param {String} file Path to a CLDR annotations.json file
     * @returns {unset?}
     */
-   static ApplyAnnotations(file) {
+   Static ApplyAnnotations(file) {
       txt := FileRead(file, "UTF-8")
       pos := 1
-      while pos := RegExMatch(txt, '"([^"\\]+)":\s*\{\s*"default":\s*\[([^\]]*)\],\s*"tts":\s*\[\s*"([^"]*)"', &m, pos) {
+      While pos := RegExMatch(txt, '"([^"\\]+)":\s*\{\s*"default":\s*\[([^\]]*)\],\s*"tts":\s*\[\s*"([^"]*)"', &m, pos) {
          pos += m.Len
          key := StrReplace(m[1], this.VS16)
-         if !this.Idx.Has(key)
-            continue
+         If !this.Idx.Has(key)
+            Continue
          kws := " " m[3]
          p2 := 1
-         while p2 := RegExMatch(m[2], '"([^"]*)"', &k, p2) {
+         While p2 := RegExMatch(m[2], '"([^"]*)"', &k, p2) {
             kws .= " " k[1]
             p2 += k.Len
          }
@@ -227,50 +225,62 @@ class UniData {
    }
 
    /**
-    * Find entries matching every term in text. Plain terms must appear in the search string
-    * (character, name, keywords, group); terms starting with "u+" must appear in the code point text.
-    * @param {String} text Space-separated search terms, e.g. "arrow u+219"
+    * Find entries matching the search text. Space-separated terms are ANDed; an uppercase OR between terms
+    * starts an alternative, so "heart red OR star" = (heart AND red) OR star. Plain terms must appear in the
+    * search string (character, name, keywords, group); terms starting with "u+" must appear in the code point text.
+    * @param {String} text Search terms, e.g. "arrow u+219" or "cat OR dog"
     * @param {Boolean} [hideSkin=false] Skip skin-tone variants
     * @returns {Array} Entry indexes of all matches, in data order
     */
-   static Search(text, hideSkin := false) {
-      tx := [], hx := []
-      for t in StrSplit(StrLower(text), " ") {   ; Sr is pre-lowered, so case-sensitive InStr is safe and faster
-         if t = ""
-            continue
-         if SubStr(t, 1, 2) = "u+"
-            hx.Push(StrUpper(t))   ; Hx entries are stored uppercase
-         else
+   Static Search(text, hideSkin := false) {
+      groups := [], tx := [], hx := []
+      For t in StrSplit(text, " ") {   ; split before lowering: only uppercase OR is an operator
+         If t == "OR" {
+            If tx.Length || hx.Length
+               groups.Push([tx, hx]), tx := [], hx := []
+            Continue
+         }
+         t := StrLower(t)             ; Sr is pre-lowered, so case-sensitive InStr is safe and faster
+         If t = ""
+            Continue
+         If SubStr(t, 1, 2) = "u+"
+            hx.Push(StrUpper(t))      ; Hx entries are stored uppercase
+         Else
             tx.Push(t)
       }
+      If tx.Length || hx.Length || !groups.Length
+         groups.Push([tx, hx])        ; last group; empty when there are no terms at all (matches everything)
       res := []
       Sr := this.Sr, Hxs := this.Hx, Fl := this.Fl
-      for i, s in Sr {
-         if hideSkin && (Fl[i] & 1)
-            continue
-         ok := true
-         ; Wildcard search would be done here
-         for t in tx {
-            if !InStr(s, t, true) {
-               ok := false
-               break
-            }
-         }
-         if ok {
-            for t in hx {
-               if !InStr(Hxs[i], t, true) {
+      For i, s in Sr {
+         If hideSkin && (Fl[i] & 1)
+            Continue
+         For g in groups {
+            ok := true
+            ; Wildcard search would be done here
+            For t in g[1] {
+               If !InStr(s, t, true) {
                   ok := false
-                  break
+                  Break
                }
             }
+            If ok {
+               For t in g[2] {
+                  If !InStr(Hxs[i], t, true) {
+                     ok := false
+                     Break
+                  }
+               }
+            }
+            If ok {
+               res.Push(i)
+               Break   ; one matching group is enough
+            }
          }
-         if ok
-            res.Push(i)
       }
-      return res
+      Return res
    }
 }
-
 /**
  * GUI and Direct2D grid renderer for the Unicode browser.
  * A child window (grid) hosts one ID2D1HwndRenderTarget that draws only the visible cells (virtual grid).
