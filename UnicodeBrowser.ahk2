@@ -36,7 +36,7 @@ TraySetIcon(A_ScriptDir "\tray.ico")
  * Static data store for the browser. Loads, caches and searches Unicode/emoji data.
  * Entries are held in parallel arrays (Ch, Nm, Gr, Kw, Hx, Fl, Sr) addressed by the same entry index.
  * Ch = character string, Nm = display name, Gr = group/block, Kw = keywords, Hx = "U+XXXX" code point text,
- * Fl = flag bits (1 = skin-tone variant, 2 = combining mark), Sr = combined search string (character, name, keywords, group).
+ * Fl = flag bits (1 = skin-tone variant, 2 = combining mark), Sr = lowercased combined search string (character, name, keywords, group).
  * Idx maps a character (VS16 stripped) to its entry index.
  */
 struct RECT {
@@ -80,7 +80,7 @@ class UniData {
       }
       Loop this.Ch.Length {
          i := A_Index
-         this.Sr.Push(this.Ch[i] " " this.Nm[i] " " this.Kw[i] " " this.Gr[i])
+         this.Sr.Push(StrLower(this.Ch[i] " " this.Nm[i] " " this.Kw[i] " " this.Gr[i]))
       }
       ToolTip()
    }
@@ -235,11 +235,11 @@ class UniData {
     */
    static Search(text, hideSkin := false) {
       tx := [], hx := []
-      for t in StrSplit(text, " ") {
+      for t in StrSplit(StrLower(text), " ") {   ; Sr is pre-lowered, so case-sensitive InStr is safe and faster
          if t = ""
             continue
          if SubStr(t, 1, 2) = "u+"
-            hx.Push(t)
+            hx.Push(StrUpper(t))   ; Hx entries are stored uppercase
          else
             tx.Push(t)
       }
@@ -251,14 +251,14 @@ class UniData {
          ok := true
          ; Wildcard search would be done here
          for t in tx {
-            if !InStr(s, t) {
+            if !InStr(s, t, true) {
                ok := false
                break
             }
          }
          if ok {
             for t in hx {
-               if !InStr(Hxs[i], t) {
+               if !InStr(Hxs[i], t, true) {
                   ok := false
                   break
                }
@@ -286,6 +286,8 @@ class UniBrowser {
    static tmr := 0
    static searchHistory := [], historyPos := 0, navigatingHistory := false
    static _d2d := 0, _dw := 0, rt := 0, br := 0, fmt := 0, fmtEmoji := 0
+   static rendering := false, again := false   ; Render re-entrancy guard
+   static lc := Map(), lcW := 0, lcH := 0       ; text layout cache: entry index -> {lay, m}, built for a cellW x cellH
    static rect := D2D1_RECT_F()
    ; Grid theme colors as 0xRRGGBB. _Color builds each one once as a D2D1_COLOR_F, ready for the D2D calls.
    static clrBack       := this._Color("0x202020")   ; grid background
@@ -294,11 +296,8 @@ class UniBrowser {
    static clrSelBorder  := this._Color("0x0078D7")   ; selected cell outline
    static clrGlyph      := this._Color("0xEBEBEB")   ; glyph color (color emoji ignore it)
    static clrBounds     := this._Color("0xa35027")   ; text-box outline
-   static clrInk        := this._Color("0x2e85b1")   ; ink box from overhang metrics
    static res           := [],   sel     := 0, top := 0, cols := 1, rows := 0, page := 1
    static cellW         := 56.0, cellH   := 56
-   static lastClick     := 0,    lastIdx := 0
-   static showInk       := false
    static FontSize      := 26
    Static BlockSize     := 56
    Static Font          := "Segoe UI"
@@ -438,7 +437,7 @@ class UniBrowser {
       this.txtInfo.OnEvent("Click", this.getInfo.Bind(this))
       this.UpdateHistoryButtons()
       this.chkSkin.OnEvent("Click", this.Refilter.Bind(this))
-      this.btnCopy.OnEvent("Click", this.CopyEnter.Bind(this))
+      this.btnCopy.OnEvent("Click", this.CopySelected.Bind(this))
       this.chkBounds.OnEvent("Click", this.OnBounds.Bind(this))
       g.OnEvent("Size", this.OnSize.Bind(this))
       g.OnMessage(0x02E0, this.OnDpiChanged.Bind(this))   ; WM_DPICHANGED
@@ -449,13 +448,12 @@ class UniBrowser {
       this.grid := Gui("-Caption +Parent" g.Hwnd " -DPIScale")
       this.Dark(this.grid.Hwnd)   ; dark scrollbar
       this.grid.Show("x0 y" this.S(44) " w" this.S(400) " h" this.S(300) " NoActivate")
-      ; For 2.1 migrate these to this.grid.OnMessage
-      OnMessage(0x000F, this.OnPaint.bind(this))
-      OnMessage(0x0014, this.OnErase.bind(this))
-      OnMessage(0x0115, this.OnVScroll.bind(this))
-      OnMessage(0x0201, this.OnClick.bind(this))
-      this.grid.OnMessage(0x0203, this.CopySel.bind(this)) ; left dbl click
-      this.grid.OnMessage(0x0204, this.CopySel.bind(this)) ; right click
+      this.grid.OnMessage(0x000F, this.OnPaint.Bind(this))    ; WM_PAINT
+      this.grid.OnMessage(0x0014, this.OnErase.Bind(this))    ; WM_ERASEBKGND
+      this.grid.OnMessage(0x0115, this.OnVScroll.Bind(this))  ; WM_VSCROLL
+      this.grid.OnMessage(0x0201, this.OnClick.Bind(this))    ; WM_LBUTTONDOWN
+      this.grid.OnMessage(0x0203, this.CopySel.Bind(this))    ; left dbl click
+      this.grid.OnMessage(0x0204, this.CopySel.Bind(this))    ; right click
       ; Create the window on the active monitor (hidden), then center it in that monitor's work area
       w := this.LoadDim("Width", 960, this.S(420)), h := this.LoadDim("Height", 660, this.S(300))
       wa := this.MonitorWork(hMon)
@@ -584,11 +582,22 @@ class UniBrowser {
     * @returns {unset?}
     */
    static MakeFormat() {
+      this.ClearLayoutCache()   ; cached layouts were built from the old formats
       for f in [this.fmt, this.fmtEmoji]
          if f
             ObjRelease(f)
       this.fmt := this.NewFormat(this.Font)
       this.fmtEmoji := this.NewFormat(this.EmojiFont)
+   }
+
+   /**
+    * Release every cached text layout. Called when the cell size or the text formats change, and when the cache is full.
+    * @returns {unset?}
+    */
+   static ClearLayoutCache() {
+      for , c in this.lc
+         ObjRelease(c.lay)
+      this.lc.Clear()
    }
 
    /**
@@ -635,6 +644,31 @@ class UniBrowser {
     * @returns {unset?}
     */
    Static Render() {
+      ; A nested Render (a paint arriving mid-frame) would call BeginDraw on a target that is already drawing, fail,
+      ; and ReleaseRT the brush under the outer frame. Nested calls just ask the running frame to draw once more.
+      if this.rendering {
+         this.again := true
+         return
+      }
+      this.rendering := true
+      wasCritical := A_IsCritical
+      Critical("On")   ; also keep timers (Recreate) and other threads from interrupting a frame
+      try {
+         Loop {
+            this.again := false
+            this.Draw()
+         } Until !this.again
+      } finally {
+         this.rendering := false
+         Critical(wasCritical)
+      }
+   }
+
+   /**
+    * Draw one frame. Call through Render, which makes the frame uninterruptible.
+    * @returns {unset?}
+    */
+   Static Draw() {
       Static cbRecreate := ObjBindMethod(this, "Recreate")
 
       If !this.rt
@@ -642,9 +676,15 @@ class UniBrowser {
 
       rt := this.rt, br := this.br, rect := this.rect, dw := this._dw
       cw := this.cellW, chh := this.cellH, cols := this.cols, top := this.top
-      showB := this.chkBounds.value, showI := this.showInk
-      n := this.res.Length
+      showB := this.chkBounds.value
+      res := this.res, Ch := UniData.Ch, Fl := UniData.Fl
+      n := res.Length
       lw := this.lw, hf := lw / 2   ; stroke width and half-pixel offset, in whole device pixels
+      lc := this.lc
+      if cw != this.lcW || chh != this.lcH || lc.Count > 2000 {   ; layouts depend on the cell box; cap the cache size
+         this.ClearLayoutCache()
+         this.lcW := cw, this.lcH := chh
+      }
 
       D2D.BeginDraw(rt)
       D2D.Clear(rt, this.clrBack)
@@ -694,7 +734,8 @@ class UniBrowser {
                D2D.DrawRectangle(rt, rect, br, lw * 1.5)
             }
 
-            ; pass 2: glyphs (color glyphs ignore the brush), each followed by its optional outlines
+            ; pass 2: glyphs (color glyphs ignore the brush). Layouts are cached per entry, so a selection change
+            ; or scroll only re-draws them; they are rebuilt only for entries not seen since the last cache reset.
             D2D.SetColor(br, this.clrGlyph)
 
             ; Reset grid position
@@ -703,48 +744,44 @@ class UniBrowser {
             row := pos // cols - top
 
             Loop count {
-               i := first + A_Index - 1
-               e := this.res[i]
-               s := UniData.Ch[e]
-
-               If UniData.Fl[e] & 2
-                  s := Chr(0x25CC) s
-
-               x := col * cw, y := row * chh
-
-               ; Same string, format and cell-sized box as before; the layout also supplies the metrics
-               lay := D2D.CreateTextLayout(dw, s, this.PickFormat(s), cw, chh)
+               e := res[first + A_Index - 1]
+               if !(c := lc.Get(e, 0)) {
+                  s := Ch[e]
+                  If Fl[e] & 2
+                     s := Chr(0x25CC) s
+                  lay := D2D.CreateTextLayout(dw, s, this.PickFormat(s), cw, chh)
+                  lc[e] := c := {lay: lay, m: 0}
+               }
                ; options 6 = CLIP | ENABLE_COLOR_FONT
-               D2D.DrawTextLayout(rt, x, y, lay, br, 6)
-
-               If showB {
-                  ; Advance x line height: the box the character occupies when inserted in a string
-                  m := D2D.GetMetrics(lay)
-                  rect.left := x + m.left
-                  rect.top := y + m.top
-                  rect.right := rect.left + m.widthIncludingTrailingWhitespace
-                  rect.bottom := rect.top + m.height
-                  D2D.SetColor(br, this.clrBounds)
-                  D2D.DrawRectangle(rt, rect, br, lw)
-               }
-               If showI {
-                  ; Ink box: overhang is relative to the layout box (the cell), so expand the cell by it
-                  o := D2D.GetOverhangMetrics(lay)
-                  rect.left := x - o.left
-                  rect.top := y - o.top
-                  rect.right := x + cw + o.right
-                  rect.bottom := y + chh + o.bottom
-                  D2D.SetColor(br, this.clrInk)
-                  D2D.DrawRectangle(rt, rect, br, lw)
-               }
-               If showB || showI
-                  D2D.SetColor(br, this.clrGlyph)
-
-               ObjRelease(lay)
+               D2D.DrawTextLayout(rt, col * cw, row * chh, c.lay, br, 6)
 
                ; Advance grid position
                If ++col = cols
                   col := 0, row++
+            }
+
+            ; pass 3: text-box outlines from the cached metrics (one color change for the whole pass)
+            If showB {
+               D2D.SetColor(br, this.clrBounds)
+               pos := first - 1
+               col := Mod(pos, cols)
+               row := pos // cols - top
+
+               Loop count {
+                  c := lc[res[first + A_Index - 1]]
+                  if !c.m
+                     c.m := D2D.GetMetrics(c.lay)
+                  m := c.m
+                  ; Advance x line height: the box the character occupies when inserted in a string
+                  rect.left := col * cw + m.left
+                  rect.top := row * chh + m.top
+                  rect.right := rect.left + m.widthIncludingTrailingWhitespace
+                  rect.bottom := rect.top + m.height
+                  D2D.DrawRectangle(rt, rect, br, lw)
+
+                  If ++col = cols
+                     col := 0, row++
+               }
             }
          }
       }
@@ -769,6 +806,10 @@ class UniBrowser {
     * @returns {unset?}
     */
    static Recreate() {
+      if this.rendering {   ; never free the target mid-frame; try again shortly
+         SetTimer(ObjBindMethod(this, "Recreate"), -50)
+         return
+      }
       this.MakeRT()
       this.Render()
    }
@@ -928,8 +969,6 @@ class UniBrowser {
          sz.width := Max(gw, 1), sz.height := Max(gh, 1)
          D2D.Resize(this.rt, sz)
          this.Layout() ; this is kinda slow, re-lays out the grid
-         ; BUG, Render seems to start some sort of cycle that hangs. Even if on a SetTimer with delay, doesn't seem necessary
-         ; this.Render()
       }
    }
    /**
@@ -953,44 +992,37 @@ class UniBrowser {
 
    /**
     * WM_PAINT handler: repaint the grid and validate its update region.
+    * @param {Gui} gui The grid window
     * @param {Integer} wParam Unused
     * @param {Integer} lParam Unused
     * @param {Integer} msg Message number
-    * @param {Integer} hwnd Window that received the message
-    * @returns {Integer?} 0 when handled for the grid window, otherwise unset
+    * @returns {Integer} 0
     */
-   static OnPaint(wParam, lParam, msg, hwnd) {
-      if hwnd != this.grid.Hwnd
-         return
+   static OnPaint(gui, wParam, lParam, msg) {
       this.Render()
-      DllCall("ValidateRect", "Ptr", hwnd, "Ptr", 0)
+      DllCall("ValidateRect", "Ptr", gui.Hwnd, "Ptr", 0)
       return 0
    }
 
    /**
     * WM_ERASEBKGND handler: suppress background erase on the grid to avoid flicker.
+    * @param {Gui} gui The grid window
     * @param {Integer} wParam Unused
     * @param {Integer} lParam Unused
     * @param {Integer} msg Message number
-    * @param {Integer} hwnd Window that received the message
-    * @returns {Integer?} 1 when handled for the grid window, otherwise unset
+    * @returns {Integer} 1
     */
-   static OnErase(wParam, lParam, msg, hwnd) {
-      if hwnd = this.grid.Hwnd
-         return 1
-   }
+   static OnErase(gui, wParam, lParam, msg) => 1
 
    /**
     * WM_VSCROLL handler: translate scrollbar actions (line, page, thumb drag, top, bottom) into a scroll.
+    * @param {Gui} gui The grid window
     * @param {Integer} wParam Low word = scroll code, high word = thumb position
     * @param {Integer} lParam Unused
     * @param {Integer} msg Message number
-    * @param {Integer} hwnd Window that received the message
-    * @returns {Integer?} 0 when handled for the grid window, otherwise unset
+    * @returns {Integer} 0
     */
-   static OnVScroll(wParam, lParam, msg, hwnd) {
-      if hwnd != this.grid.Hwnd
-         return
+   static OnVScroll(gui, wParam, lParam, msg) {
       code := wParam & 0xFFFF, pos := (wParam >> 16) & 0xFFFF
       switch code {
          case 0: t := this.top - 1
@@ -1008,20 +1040,17 @@ class UniBrowser {
 
    /**
     * WM_LBUTTONDOWN handler: select the cell under the cursor and update the info text and display.
+    * @param {Gui} gui The grid window
     * @param {Integer} wParam Unused
     * @param {Integer} lParam Low word = x, high word = y (client coordinates)
     * @param {Integer} msg Message number
-    * @param {Integer} hwnd Window that received the message
-    * @returns {Integer?} 0 when handled for the grid window, otherwise unset
+    * @returns {Integer} 0
     */
-   static OnClick(wParam, lParam, msg, hwnd) {
-      if hwnd != this.grid.Hwnd
-         return
+   static OnClick(gui, wParam, lParam, msg) {
       x := lParam & 0xFFFF, y := (lParam >> 16) & 0xFFFF
       idx := (this.top + y // this.cellH) * this.cols + Floor(x / this.cellW) + 1
       if idx > this.res.Length
          return 0
-      this.lastIdx := idx, this.lastClick := A_TickCount
       this.sel := idx
       this.ShowInfo()
       this.Render()
@@ -1031,13 +1060,13 @@ class UniBrowser {
    ; ---------------------------------------------------------------- filter / info
 
    /**
-    * Filter edit Change event: debounce typing by scheduling Refilter in 150 ms.
+    * Filter edit Change event: debounce typing by scheduling Refilter in 200 ms.
     * @returns {unset?}
     */
    static OnFilter(*) {
       if this.navigatingHistory
          return
-      SetTimer(this.tmr, -200)   ; debounce typing
+      SetTimer(this.tmr, strlen(Trim(this.edFilter.Value)) > 2 ? -220: -600)   ; debounce typing (200 ms)
    }
    /**
     * Clear the filter edit and immediately apply the empty search.
@@ -1061,8 +1090,7 @@ class UniBrowser {
     * @returns {Boolean}
     */
    static FilterFocused() {
-      return this.main && WinActive("ahk_id " this.main.Hwnd)
-         && DllCall("GetFocus", "Ptr") = this.edFilter.Hwnd
+      return this.Active() && DllCall("GetFocus", "Ptr") = this.edFilter.Hwnd
    }
 
    /**
@@ -1092,8 +1120,8 @@ class UniBrowser {
    }
 
    /**
-    * Add a distinct search string to the history. A new search after Back discards the forward branch.
-    * The initial empty search is not stored, but clearing a non-empty history is a valid history entry.
+    * Add a distinct, non-blank search string to the history. A new search after Back discards the forward branch.
+    * Blank searches are never stored.
     * @param {String} text Search string
     * @returns {unset?}
     */
@@ -1117,14 +1145,12 @@ class UniBrowser {
     * @returns {unset?}
     */
    static NavigateHistory(direction, *) {
-
       SetTimer(this.tmr, 0)   ; cancel a pending debounced search
       text := Trim(this.edFilter.Value)
-      offList := text = "" && this.historyPos   ; blank state isn't in the history
+      offList := text = "" && this.historyPos   ; a blank box is not in the history: it sits just past the current entry
       if !offList && (!this.historyPos || text != this.searchHistory[this.historyPos])
          this.RecordHistory(text)
       target := offList ? (direction < 0 ? this.historyPos : 0) : this.historyPos + direction
-
       if target < 1 || target > this.searchHistory.Length {
          this.ApplySearch(text)
          this.UpdateHistoryButtons()
@@ -1197,19 +1223,17 @@ class UniBrowser {
       }
    }
    /**
-    * Copy the selected character (or the first result if none is selected) to the clipboard and show a tooltip.
+    * Grid double-click / right-click handler: copy the selected character.
     * @returns {unset?}
     */
-   Static CopyEnter(*) {
+   static CopySel(*) {
       this.CopySelected()
    }
-   static CopySel(GuiOrCtrlObj, wParam, lParam, msg) {
-      Switch GuiOrCtrlObj {
-         Case this.grid :
-            this.CopySelected()
-         Default :
-      }
-   }
+   /**
+    * Copy the selected character (or the first result if none is selected) to the clipboard and show a tooltip.
+    * Also the Copy button Click handler.
+    * @returns {unset?}
+    */
    Static CopySelected(*) {
       if !this.res.Length
          return
