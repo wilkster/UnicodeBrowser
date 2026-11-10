@@ -1287,6 +1287,10 @@ UniBrowser.Start()
 #HotIf UniBrowser.OverGrid()
 WheelUp::UniBrowser.Wheel(-1)
 WheelDown::UniBrowser.Wheel(1)
+Left::UniBrowser.Nav(-1, 0)
+Right::UniBrowser.Nav(1, 0)
+Up::UniBrowser.Nav(0, -1)
+Down::UniBrowser.Nav(0, 1)
 #HotIf
 
 ; Arrow keys move the selection while the window is active, even with focus in the filter box
@@ -1295,9 +1299,5 @@ WheelDown::UniBrowser.Wheel(1)
 ^Backspace::UniBrowser.ClearFilter()
 #HotIf
 
-#HotIf UniBrowser.Active()
-Left::UniBrowser.Nav(-1, 0)
-Right::UniBrowser.Nav(1, 0)
-Up::UniBrowser.Nav(0, -1)
-Down::UniBrowser.Nav(0, 1)
-#HotIf
+; #HotIf UniBrowser.Active()
+; #HotIf
