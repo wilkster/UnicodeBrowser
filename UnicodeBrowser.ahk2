@@ -1041,7 +1041,7 @@ class UniBrowser {
    }
    /**
     * Clear the filter edit and immediately apply the empty search.
-    * The cleared value is recorded as a history entry, just like clearing it manually.
+    * The cleared value is not recorded in the history.
     * @returns {unset?}
     */
    static ClearFilter(*) {
@@ -1052,7 +1052,6 @@ class UniBrowser {
       } finally {
          this.navigatingHistory := false
       }
-      this.RecordHistory("")
       this.ApplySearch("")
    }
 
@@ -1099,12 +1098,13 @@ class UniBrowser {
     * @returns {unset?}
     */
    static RecordHistory(text) {
-      if !this.searchHistory.Length && text = ""
+      if text = ""
          return
       if this.historyPos && this.searchHistory[this.historyPos] = text
          return
       while this.searchHistory.Length > this.historyPos
          this.searchHistory.Pop()
+
       this.searchHistory.Push(text)
       this.historyPos := this.searchHistory.Length
       this.UpdateHistoryButtons()
@@ -1117,11 +1117,14 @@ class UniBrowser {
     * @returns {unset?}
     */
    static NavigateHistory(direction, *) {
+
       SetTimer(this.tmr, 0)   ; cancel a pending debounced search
       text := Trim(this.edFilter.Value)
-      if !this.historyPos || text != this.searchHistory[this.historyPos]
+      offList := text = "" && this.historyPos   ; blank state isn't in the history
+      if !offList && (!this.historyPos || text != this.searchHistory[this.historyPos])
          this.RecordHistory(text)
-      target := this.historyPos + direction
+      target := offList ? (direction < 0 ? this.historyPos : 0) : this.historyPos + direction
+
       if target < 1 || target > this.searchHistory.Length {
          this.ApplySearch(text)
          this.UpdateHistoryButtons()
