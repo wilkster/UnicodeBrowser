@@ -1,7 +1,7 @@
 ;@Ahk2Exe-SetName Unicode Browser
 ;@Ahk2Exe-SetDescription Unicode Browser
 ;@Ahk2Exe-Set Comments, Unicode and Emoji Browser
-;@Ahk2Exe-SetVersion 2026.10.12
+;@Ahk2Exe-SetVersion 2026.11.11
 ;@Ahk2Exe-SetCopyright Copyright (c) 2026 Tom Wilkason
 ;@Ahk2Exe-SetOrigFilename UnicodeBrowser.exe
 ;@Ahk2Exe-SetMainIcon Tray.ico
@@ -26,6 +26,8 @@ TraySetIcon(A_ScriptDir "\tray.ico")
 ; - Filter: words are ANDed and match name, keywords, group or the character itself.
 ;   A term starting with "u+" matches code points, e.g.  u+1f60   or   arrow u+219
 ; - Click selects, double-click or Enter copies. Mouse wheel scrolls over the grid.
+; - Group list (left): every group/block that has hits in the current search, with counts. Click one to restrict
+;   the grid to it. With an empty filter it lists everything, so a group can be browsed without typing.
 /* TODO
  * x Detect when restored what the prior window was that had focus, then a RMB will send the key to that window
  * x Track recent selections that were copied to the clipboard and have a button to show them vs filtered. Save them to the INI file, max up to 120.
@@ -297,6 +299,7 @@ class UniBrowser {
    static tmr := 0
    static searchHistory := [], historyPos := 0, navigatingHistory := false
    static recent := [], maxRecent := 100   ; copy history: entry indexes, oldest first, latest at the end
+   static lstGroup := 0, grpKeys := [""], grpSel := "", hits := [], filterText := ""   ; hits = search hits before the group filter
    static _d2d := 0, _dw := 0, rt := 0, br := 0, fmt := 0, fmtEmoji := 0
    static rendering := false, again := false   ; Render re-entrancy guard
    static lc := Map(), lcW := 0, lcH := 0       ; text layout cache: entry index -> {lay, m}, built for a cellW x cellH
@@ -372,7 +375,7 @@ class UniBrowser {
       SendMessage(0x30, this.fFilter, 1, this.edFilter)   ; WM_SETFONT
       SendMessage(0x30, this.fFilter, 1, this.btnBack)
       SendMessage(0x30, this.fFilter, 1, this.btnForward)
-      for c in [this.chkSkin, this.chkBounds, this.chkRecents, this.txtInfo, this.txtMetrics, this.btnCopy]
+      for c in [this.chkSkin, this.chkBounds, this.chkRecents, this.lstGroup, this.txtInfo, this.txtMetrics, this.btnCopy]
          SendMessage(0x30, this.fUI, 1, c)
       for f in old
          if f
@@ -434,6 +437,7 @@ class UniBrowser {
       this.chkBounds := g.AddCheckbox("x0 y0 w" this.S(100), "Show bounds")
       this.chkBounds.Value := IniRead(this.ini,"Settings","Show Bounds", true)
       this.chkRecents := g.AddCheckbox("x0 y0 w" this.S(92), "Show recents")
+      this.lstGroup := g.AddListBox("x0 y0 w" this.S(170) " h" this.S(200) " Background2D2D2D +0x100")   ; 0x100 = LBS_NOINTEGRALHEIGHT
       this.txtInfo := g.AddText("x0 y0 w" this.S(75) " h" this.S(60) " 0x80")   ; SS_NOPREFIX: keep '&'
       this.txtInfo.Value := "Please Wait..."
       this.txtMetrics := g.AddText("x0 y0 w" this.S(230) " h" this.S(60) " 0x80")
@@ -446,15 +450,18 @@ class UniBrowser {
       this.Dark(this.btnCopy.Hwnd) ; Color
       this.Dark(this.chkBounds.Hwnd) ; Color
       this.Dark(this.chkRecents.Hwnd) ; Color
+      this.Dark(this.lstGroup.Hwnd) ; Color
       this.edFilter.OnEvent("Change", this.OnFilter.Bind(this))
       this.btnBack.OnEvent("Click", this.NavigateHistory.Bind(this, -1))
       this.btnForward.OnEvent("Click", this.NavigateHistory.Bind(this, 1))
-      this.txtInfo.OnEvent("Click", this.getInfo.Bind(this))
+      this.txtInfo.OnEvent("Click", this.pickGroup.Bind(this))
+      this.txtInfo.OnEvent("ContextMenu", this.getInfo.Bind(this))
       this.UpdateHistoryButtons()
       this.chkSkin.OnEvent("Click", this.Refilter.Bind(this))
       this.btnCopy.OnEvent("Click", this.CopySelected.Bind(this))
       this.chkBounds.OnEvent("Click", this.OnBounds.Bind(this))
       this.chkRecents.OnEvent("Click", this.OnRecents.Bind(this))
+      this.lstGroup.OnEvent("Change", this.OnGroup.Bind(this))
       g.OnEvent("Size", this.OnSize.Bind(this))
       g.OnMessage(0x02E0, this.OnDpiChanged.Bind(this))   ; WM_DPICHANGED
       g.OnEvent("Close", (*) => ExitApp())
@@ -476,6 +483,8 @@ class UniBrowser {
       g.Show("Hide x" wa.l " y" wa.t " w" w " h" h)
       WinGetPos(, , &ww, &wh, g.Hwnd)
       g.Show("x" wa.l + (wa.r - wa.l - ww) // 2 " y" wa.t + (wa.b - wa.t - wh) // 2)
+      this.hits := UniData.Search("", this.chkSkin.Value)   ; empty search = everything, for the initial group list
+      this.BuildGroups()
       this.InitD2D()
       this.Layout()
       this.ShowInfo()
@@ -983,6 +992,7 @@ class UniBrowser {
       navW := this.S(28), navGap := this.S(3), filterX := pad + 2 * (navW + navGap)
       rx := w - pad - this.S(92), bx := rx - this.S(88), sx := bx - this.S(96)
       by := h - botH + this.S(6), bh := botH - this.S(10)
+      lstW := this.S(170), gx := pad + lstW + pad   ; group list on the left, grid fills the rest
       this.chkSkin.GetPos(, , , &ch)   ; keep the checkboxes' current height
       ; Use deferred batch updates so we don't get controls wiping each other out on resize
       items := [
@@ -992,7 +1002,8 @@ class UniBrowser {
          [this.chkSkin,    sx, pad + this.S(4), this.S(96), ch],
          [this.chkBounds,  bx, pad + this.S(4), this.S(88), ch],
          [this.chkRecents, rx, pad + this.S(4), this.S(92), ch],
-         [this.grid,       0, topH, w, Max(1, h - topH - botH)],
+         [this.lstGroup,   pad, topH, lstW, Max(1, h - topH - botH)],
+         [this.grid,       gx, topH, Max(1, w - gx), Max(1, h - topH - botH)],
          [this.txtInfo,    pad, by, w - pad * 4 - this.S(80) - mw, bh],
          [this.txtMetrics, w - pad * 2 - this.S(80) - mw, by, mw, bh],
          [this.btnCopy,    w - pad - this.S(80), by, this.S(80), this.S(30)]
@@ -1162,8 +1173,14 @@ class UniBrowser {
     */
    static ApplySearch(text) {
       this.sel := 0, this.top := 0
-      this.res := this.chkRecents.Value ? this.RecentList()
-         : text = "" ? [] : UniData.Search(text, this.chkSkin.Value)
+      this.filterText := text
+      if this.chkRecents.Value
+         this.res := this.RecentList()
+      else {
+         this.hits := UniData.Search(text, this.chkSkin.Value)   ; empty text = everything: feeds the group counts
+         this.BuildGroups()
+         this.ApplyGroup()
+      }
       this.Layout()
       this.ShowInfo()
       this.Render()
@@ -1236,13 +1253,91 @@ class UniBrowser {
       this.Render()
    }
    /**
-    * Show Recents toggled: disable the filter edit while on, then rebuild the grid.
+    * Rebuild the group list from the current search hits: "All" plus every group that has at least one hit,
+    * with its count. Emoji groups come first, then Unicode blocks in code point order (data order).
+    * The selected group is kept if it still has hits, otherwise the selection falls back to All.
+    * Choose does not raise the Change event, so this never re-enters OnGroup.
+    * @returns {unset?}
+    */
+   static BuildGroups() {
+      cnt := Map(), order := []
+      Gr := UniData.Gr
+      for i in this.hits {
+         g := Gr[i] != "" ? Gr[i] : "(ungrouped)"
+         if cnt.Has(g)
+            cnt[g]++
+         else {
+            cnt[g] := 1
+            order.Push(g)
+         }
+      }
+      items := ["All (" this.hits.Length ")"], keys := [""]
+      for g in order {
+         items.Push(g " (" cnt[g] ")")
+         keys.Push(g)
+      }
+      pos := 1
+      if this.grpSel != "" {
+         for k, v in keys {
+            if v == this.grpSel {
+               pos := k
+               break
+            }
+         }
+         if pos = 1
+            this.grpSel := ""
+      }
+      lb := this.lstGroup
+      lb.Opt("-Redraw")
+      lb.Delete()
+      lb.Add(items)
+      lb.Choose(pos)
+      lb.Opt("+Redraw")
+      this.grpKeys := keys
+   }
+
+   /**
+    * Build the grid results from the search hits and the selected group. With no group, the hits are
+    * shown as is, and an empty filter shows nothing.
+    * @returns {unset?}
+    */
+   static ApplyGroup() {
+      if this.grpSel = "" {
+         this.res := this.filterText = "" ? [] : this.hits
+         return
+      }
+      Gr := UniData.Gr, key := this.grpSel, out := []
+      for i in this.hits {
+         if (Gr[i] != "" ? Gr[i] : "(ungrouped)") == key
+            out.Push(i)
+      }
+      this.res := out
+   }
+
+   /**
+    * Group list Change event: restrict the grid to the chosen group (or All) without redoing the search.
+    * @returns {unset?}
+    */
+   static OnGroup(*) {
+      v := this.lstGroup.Value
+      if !v
+         return
+      this.grpSel := this.grpKeys[v]
+      this.sel := 0, this.top := 0
+      this.ApplyGroup()
+      this.Layout()
+      this.ShowInfo()
+      this.Render()
+   }
+
+   /**
+    * Show Recents toggled: disable the filter edit and group list while on, then rebuild the grid.
     * Refilter commits any pending debounced filter text first.
     * @returns {unset?}
     */
    static OnRecents(*) {
       SetTimer(this.tmr, 0)
-      this.edFilter.Enabled := !this.chkRecents.Value
+      this.edFilter.Enabled := this.lstGroup.Enabled := !this.chkRecents.Value
       this.UpdateHistoryButtons()
       this.Refilter()
       if this.edFilter.Enabled
@@ -1340,11 +1435,29 @@ class UniBrowser {
       } Else If this.chkRecents.Value {
          this.txtInfo.Value := this.res.Length ? this.res.Length " recent characters" : "No recent characters"
          this.txtMetrics.Value := ""
-      } Else If Trim(this.edFilter.Value) = ""
-         this.txtInfo.Value := "Type in the filter box to show characters."
+      } Else If Trim(this.edFilter.Value) = "" && this.grpSel = ""
+         this.txtInfo.Value := "Type in the filter box or pick a group."
       Else {
          this.txtInfo.Value := this.res.Length ? this.res.Length " matching characters" : "No matches"
          this.txtMetrics.Value := ""
+      }
+   }
+   /**
+    * When clicking the text at the bottom, filter on the group
+    * @param GuiOrCtrlObj Gui control
+    * @returns {unset?} 
+    */
+   Static pickGroup(GuiOrCtrlObj, *) {
+      If this.sel {
+         i := this.res[this.sel]
+         group := UniData.Gr[i]
+         this.lstGroup.Enabled := this.edFilter.Enabled := true
+         this.edFilter.value := group
+         If (this.chkRecents) {
+            ; Want history to point at the last entry
+         }
+         this.chkRecents.Value := false
+         this.OnFilter()
       }
    }
    /**
@@ -1352,7 +1465,7 @@ class UniBrowser {
     * @param GuiOrCtrlObj Gui control
     * @returns {unset?} 
     */
-   Static getInfo(GuiOrCtrlObj,*) {
+   Static getInfo(GuiOrCtrlObj, *) {
       If this.sel {
          i := this.res[this.sel]
          A_Clipboard := UniData.Hx[i]
