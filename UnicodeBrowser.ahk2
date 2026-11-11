@@ -27,6 +27,7 @@ TraySetIcon(A_ScriptDir "\tray.ico")
 ;   A term starting with "u+" matches code points, e.g.  u+1f60   or   arrow u+219
 ; - Click selects, double-click or Enter copies. Mouse wheel scrolls over the grid.
 /* TODO
+ * x Detect when restored what the prior window was that had focus, then a RMB will send the key to that window
  * 
 */
 
@@ -415,7 +416,7 @@ class UniBrowser {
       this.SetDPI(this.GetDPI(0, &hMon))   ; DPI of the monitor the active window is on (not A_ScreenDPI)
 
       this.InitDark() ; Color
-      g := this.main := Gui("+Resize -DPIScale +MinSize" this.S(420) "x" this.S(300), "Unicode Browser")
+      this.Gui := g := this.main := Gui("+Resize -DPIScale +MinSize" this.S(420) "x" this.S(300), "Unicode Browser")
       g.BackColor := "202020" ; Color
       this.DarkTitle(g.Hwnd)
       g.SetFont("s14 bold cE6E6E6", this.Font)
@@ -478,6 +479,37 @@ class UniBrowser {
       this.grid.opt("+0x200000")
       OnExit(this.SaveSize.Bind(this))
       this.starting := false
+      OnMessage(0x404, this.TrayMessage.Bind(this))
+
+   }
+   /**
+    * Tray message callback when icon is clicked, toggle the window visibility
+    */
+   Static TrayMessage(wParam, lParam, uMsg, hWnd) {
+      Switch lParam {
+         Case 0x201:   ; WM_LBUTTONDOWN user left-pressed tray icon
+            ; Send "#{Tab}"
+         Case 0x202:   ; WM_LBUTTONUP user left-released tray icon
+            state := WinGetMinMax(this.Gui)
+            Switch state {
+               Case -1:
+                  WinRestore(this.Gui)
+                  this.Gui.show()
+               Case 0, 1:
+                  WinMinimize(this.Gui)
+                  this.Gui.hide()
+               Default:
+            }
+         Case 0x203:   ; WM_LBUTTONDBLCLK user double left-clicked tray icon
+         Case 0x204:   ; WM_RBUTTONDOWN user right-pressed tray icon
+         Case 0x205:   ; WM_RBUTTONUP user right-released tray icon
+         Case 0x206:   ; WM_RBUTTONDBLCLK	Right double-click
+         Case 0x207:   ; WM_MBUTTONDOWN	Middle button pressed
+         Case 0x208:   ; WM_MBUTTONUP user middle-clicked tray icon
+         Case 0x209:   ; WM_MBUTTONDBLCLK	Middle double-click
+         Case 0x20A:   ; WM_MOUSEWHEEL	Mouse wheel rotated
+         Default:
+      }
    }
 
    ; ---------------------------------------------------------------- dark mode
@@ -938,6 +970,7 @@ class UniBrowser {
    static OnSize(gui, minMax, w, h) {
       ; static renderCB := this.Render.bind(this)
       If minMax = -1 {
+         ; Dramatically reduce/prune memory when minimizing
          DllCall("psapi\EmptyWorkingSet", "ptr", -1)
          Return
       }
