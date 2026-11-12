@@ -12,7 +12,6 @@
 #DllLoad "d2d1.dll"
 #DllLoad "dwrite.dll"
 #Include "clsD2D.ahk2"
-try DllCall("SetProcessDpiAwarenessContext", "Ptr", -4, "Ptr")   ; PER_MONITOR_AWARE_V2; fails harmlessly if already set
 TraySetIcon(A_ScriptDir "\tray.ico")
 ; Unicode / emoji browser
 ; - One Direct2D HwndRenderTarget draws the visible cells only (virtual grid), so
@@ -52,6 +51,7 @@ struct RECT {
 Class UniData {
    Static Dir := A_ScriptDir "\UnicodeData"
    Static Ch := [], Nm := [], Gr := [], Kw := [], Hx := [], Fl := [], Sr := []
+   Static All := []   ; every entry index (1..n): the default candidate list for Search
    Static Idx := Map()
    Static VS16 := Chr(0xFE0F)
 
@@ -97,6 +97,7 @@ Class UniData {
       Loop this.Ch.Length {
          i := A_Index
          this.Sr.Push(StrLower(this.Ch[i] " " this.Nm[i] " " this.Kw[i] " " this.Gr[i]))
+         this.All.Push(i)
       }
       ToolTip()
    }
@@ -140,7 +141,7 @@ Class UniData {
 
       ; Splash window: one row per file with its status
       g := Gui("+AlwaysOnTop -SysMenu", "Unicode Browser - Downloading")
-      g.BackColor := UniBrowser.clrBack
+      g.BackColor := UniBrowser.hxClrBack
       g.SetFont("s10 cE6E6E6", "Segoe UI")
       g.MarginX := 16, g.MarginY := 12
       g.AddText("w500", "Downloading Unicode data. This can take a while on a slow connection, please wait...")
@@ -349,9 +350,11 @@ Class UniData {
     * search string (character, name, keywords, group); terms starting with "u+" must appear in the code point text.
     * @param {String} text Search terms, e.g. "arrow u+219" or "cat OR dog"
     * @param {Boolean} [hideSkin=false] Skip skin-tone variants
+    * @param {Array} [cand] Entry indexes to search within, in data order (default: every entry). Used to narrow
+    *    the previous results while typing; the array is only read.
     * @returns {Array} Entry indexes of all matches, in data order
     */
-   Static Search(text, hideSkin := false) {
+   Static Search(text, hideSkin := false, cand?) {
       groups := [], tx := [], hx := []
       For t in StrSplit(text, " ") {   ; split before lowering: only uppercase OR is an operator
          If t == "OR" {
@@ -371,7 +374,8 @@ Class UniData {
          groups.Push([tx, hx])        ; last group; empty when there are no terms at all (matches everything)
       res := []
       Sr := this.Sr, Hxs := this.Hx, Fl := this.Fl
-      For i, s in Sr {
+      For i in cand ?? this.All {
+         s := Sr[i]
          If hideSkin && (Fl[i] & 1)
             Continue
          For g in groups {
@@ -407,8 +411,7 @@ Class UniData {
  * cols/rows/page = grid geometry, cellW/cellH = cell size in pixels.
  */
 class UniBrowser {
-   static dpi := 96, sc := 96 / 72, lw := 1, starting := true   ; dpi/sc/lw are set from the active monitor in Start
-   static fFilter := 0, fUI := 0                                  ; HFONTs rebuilt on every DPI change
+   static dpi := 96, sc := 96 / 72, lw := 1, starting := true   ; dpi/sc/lw are set from the active monitor in Start, then kept current by OnDpiChanged
    static ini := A_ScriptDir "\UnicodeBrowser.ini"
    static main := 0, grid := 0, edFilter := 0, btnClear := 0, btnBack := 0, btnForward := 0
    static chkSkin := 0, chkBounds := 0, chkRecents := 0, txtInfo := 0, txtMetrics := 0, btnCopy := 0
@@ -416,13 +419,15 @@ class UniBrowser {
    static searchHistory := [], historyPos := 0, navigatingHistory := false
    static recent := [], maxRecent := 100   ; copy history: entry indexes, oldest first, latest at the end
    static lstGroup := 0, grpKeys := [""], grpSel := "", hits := [], filterText := ""   ; hits = search hits before the group filter
+   static lastText := "", lastSkin := -1, allHits := Map(), grpSig := ""   ; text/skin that produced hits, empty-search hits per skin setting, group list contents
    static _d2d := 0, _dw := 0, rt := 0, br := 0, fmt := 0, fmtEmoji := 0, rtW := 0, rtH := 0
    static tipTmr := 0, tipT0 := 0, tipShown := false
    static rendering := false, again := false   ; Render re-entrancy guard
-   static lc := Map(), lcW := 0, lcH := 0       ; text layout cache: entry index -> {lay, m}, built for a cellW x cellH
+   static lc := Map(), lcH := 0                 ; text layout cache: entry index -> {lay, m}, built in a cellH x cellH box
    static rect := D2D1_RECT_F()
    ; Grid theme colors as 0xRRGGBB. _Color builds each one once as a D2D1_COLOR_F, ready for the D2D calls.
    static clrBack       := this._FloatColor(this.hxClrBack := "0x202020")   ; grid background
+   static clrTxt        := this._FloatColor(this.hxclrTxt := "0xE6E6E6")   ; grid background
    static clrCellBorder := this._FloatColor("0x3A3A3A")   ; cell outlines
    static clrSelFill    := this._FloatColor("0x264F78")   ; selected cell fill
    static clrSelBorder  := this._FloatColor("0x0078D7")   ; selected cell outline
@@ -481,49 +486,49 @@ class UniBrowser {
    }
 
    /**
-    * (Re)create the UI fonts at the current DPI and apply them to the controls. Sizes are in points, so
-    * pixel height = pt * dpi / 72. Old fonts are deleted after the controls switch over.
-    * @returns {unset?}
-    */
-   static ApplyFonts() {
-      old := [this.fFilter, this.fUI]
-      mk := (pt, w) => DllCall("CreateFontW", "Int", -this.S(pt), "Int", 0, "Int", 0, "Int", 0, "Int", w, "UInt", 0, "UInt", 0
-         , "UInt", 0, "UInt", 1, "UInt", 0, "UInt", 0, "UInt", 5, "UInt", 0, "Str", this.Font, "Ptr")   ; CLEARTYPE_QUALITY
-      this.fFilter := mk(14, 700), this.fUI := mk(10, 400)
-      SendMessage(0x30, this.fFilter, 1, this.edFilter)   ; WM_SETFONT
-      SendMessage(0x30, this.fFilter, 1, this.btnClear)
-      SendMessage(0x30, this.fFilter, 1, this.btnBack)
-      SendMessage(0x30, this.fFilter, 1, this.btnForward)
-      for c in [this.chkSkin, this.chkBounds, this.chkRecents, this.lstGroup, this.txtInfo, this.txtMetrics, this.btnCopy]
-         SendMessage(0x30, this.fUI, 1, c)
-      for f in old
-         if f
-            DllCall("DeleteObject", "Ptr", f)
-   }
-
-   /**
-    * WM_DPICHANGED handler: the window moved to a monitor with a different DPI. Rescale fonts, the D2D text
-    * format and the window (to the system-suggested rectangle); Size/Layout/Render follow from the resize.
-    * During Start the suggested rectangle is ignored because Start already sized the window for this DPI.
+    * WM_DPICHANGED handler. AutoHotkey 2.1 is per-monitor aware and rescales the window, the controls and their
+    * fonts itself, so this only keeps the script's own pixel math current (DPI, scale factor, D2D text formats).
+    * There is deliberately no return value, so AutoHotkey's own handling still runs afterwards.
     * @param {Gui} gui Main GUI
     * @param {Integer} wParam Low word = new DPI
     * @param {Integer} lParam Pointer to the suggested window RECT
     * @param {Integer} msg Message number
-    * @returns {Integer} 0
+    * @returns {unset?}
     */
    static OnDpiChanged(gui, wParam, lParam, msg) {
-      this.SetDPI(wParam & 0xFFFF)
-      this.main.Opt("+MinSize" this.S(480) "x" this.S(300))
-      this.ApplyFonts()
+      this.ApplyDPI(wParam & 0xFFFF)
+      if !this.starting   ; Start does its own final layout
+         SetTimer(this.AfterDpiChange.Bind(this), -1)
+   }
+
+   /**
+    * Switch the script's pixel math to a new DPI: scale factor, stroke width and the D2D text formats
+    * (which also drops the cached text layouts). Does nothing if the DPI is unchanged.
+    * @param {Integer} dpi New DPI
+    * @returns {Boolean} True if the DPI changed
+    */
+   static ApplyDPI(dpi) {
+      if !dpi || dpi = this.dpi
+         return false
+      this.SetDPI(dpi)
       if this.fmt
          this.MakeFormat()
-      if !this.starting {
-         x := NumGet(lParam, 0, "Int"), y := NumGet(lParam, 4, "Int")
-         DllCall("SetWindowPos", "Ptr", gui.Hwnd, "Ptr", 0, "Int", x, "Int", y
-            , "Int", NumGet(lParam, 8, "Int") - x, "Int", NumGet(lParam, 12, "Int") - y, "UInt", 0x14)   ; NOZORDER | NOACTIVATE
-         this.ShowInfo()   ; refresh the metrics text and repaint with the new format
-      }
-      return 0
+      return true
+   }
+
+   /**
+    * Runs once AutoHotkey has finished its own DPI handling (window resized, controls and fonts rescaled):
+    * reapply the minimum size and window icon for the new DPI, then place every control again from the design
+    * values. Arrange computes absolute pixel positions, so whatever AutoHotkey did to the controls' positions and
+    * sizes in between is simply overwritten; only its font rescaling is kept.
+    * @returns {unset?}
+    */
+   static AfterDpiChange() {
+      this.main.Opt("+MinSize640x400")
+      ; this.SetWindowIcon(this.main.Hwnd, A_ScriptDir "\tray.ico")
+      this.Arrange()
+      this.ShowInfo()
+      this.Render()
    }
 
    /**
@@ -540,30 +545,31 @@ class UniBrowser {
       this.SetDPI(this.GetDPI(0, &hMon))   ; DPI of the monitor the active window is on (not A_ScreenDPI)
 
       this.InitDark() ; Color
-      this.Gui := g := this.main := Gui("+Resize -DPIScale +MinSize" this.S(480) "x" this.S(300), "Unicode Browser")
-      this.SetWindowIcon(g.Hwnd, A_ScriptDir "\tray.ico")
+      this.Gui := g := this.main := Gui("+Resize +DPIScale +MinSize640x400", "Unicode Browser")
+      ; this.SetWindowIcon(g.Hwnd, A_ScriptDir "\tray.ico")
       g.BackColor := this.hxClrBack ; Color
       this.DarkTitle(g.Hwnd)
-      g.SetFont("s14 bold cE6E6E6", this.Font)
-      pad := this.S(8), navW := this.S(28), navGap := this.S(3)
-      forwardX := pad + navW + navGap, filterX := pad + 2 * (navW + navGap)
-      this.btnBack := g.AddButton("x" pad " y" pad " w" navW " h" this.S(28) " -Wrap", "◀")
-      this.btnForward := g.AddButton("x" forwardX " y" pad " w" navW " h" this.S(28) " -Wrap", "▶")
-      this.edFilter := g.AddEdit("x" filterX " y" pad " w" this.S(300) " h" this.S(28) " Background" this.clrEntry)
+
+      g.SetFont("s16 bold q5 C" this.hxclrTxt, this.Font)
+      pad             := 8,                   navW    := 28, navGap := 3
+      forwardX        := pad + navW + navGap, filterX := pad + 2 * (navW + navGap)
+      this.btnBack    := g.AddButton("x" pad " y" pad " w" navW " h" 28 " -Wrap", "🡨") ; ◀ 🡠
+      this.btnForward := g.AddButton("x" forwardX " y" pad " w" navW " h" 28 " -Wrap", "🡪") ; ▶ 🡢
+      this.edFilter   := g.AddEdit("x" filterX " y" pad " w" 300 " h" 28 " Background" this.clrEntry)
       SendMessage(0x1501, true, StrPtr("Search name, keyword, group or u+hex"), this.edFilter)   ; EM_SETCUEBANNER
-      this.btnClear := g.AddButton("x" (filterX + this.S(300) + navGap) " y" pad " w" navW " h" this.S(28) " -Wrap", "✖")   ; positioned in OnSize
-      g.SetFont("s10 Norm cE6E6E6", this.Font)
-      this.chkSkin := g.AddCheckbox("x0 y0 w" this.S(100), "Hide skin tones")
-      this.chkSkin.Value := IniRead(this.ini,"Settings","Hide Skin Tones", true)
-      this.chkBounds := g.AddCheckbox("x0 y0 w" this.S(100), "Show bounds")
+      this.btnClear := g.AddButton("x" (filterX + 300 + navGap) " y" pad " w" navW " h" 28 " -Wrap", "✖")   ; positioned in OnSize
+
+      g.SetFont("s10 Norm q5 C" this.hxclrTxt, this.Font)
+      this.chkSkin         := g.AddCheckbox("x0 y0 w" 100, "Hide skin tones")
+      this.chkSkin.Value   := IniRead(this.ini,"Settings","Hide Skin Tones", true)
+      this.chkBounds       := g.AddCheckbox("x0 y0 w" 100, "Show bounds")
       this.chkBounds.Value := IniRead(this.ini,"Settings","Show Bounds", true)
-      this.chkRecents := g.AddCheckbox("x0 y0 w" this.S(92), "Show recents")
-      this.lstGroup := g.AddListBox("x0 y0 w" this.S(170) " h" this.S(200) " Background" this.clrEntry " +0x100")   ; 0x100 = LBS_NOINTEGRALHEIGHT
-      this.txtInfo := g.AddText("x0 y0 w" this.S(75) " h" this.S(60) " 0x80")   ; SS_NOPREFIX: keep '&'
-      this.txtInfo.Value := "Please Wait..."
-      this.txtMetrics := g.AddText("x0 y0 w" this.S(230) " h" this.S(60) " 0x80")
-      this.btnCopy := g.AddButton("Default x0 y0 w" this.S(80) " h" this.S(30), "Copy")
-      this.ApplyFonts()   ; the SetFont calls above only supply the colors; real sizes come from the monitor DPI
+      this.chkRecents      := g.AddCheckbox("x0 y0 w" 92, "Show recents")
+      this.lstGroup        := g.AddListBox("x0 y0 w" 170 " h" 200 " Background" this.clrEntry " +0x100")   ; 0x100 = LBS_NOINTEGRALHEIGHT
+      this.txtInfo         := g.AddText("x0 y0 w" 75 " h" 60 " 0x80")   ; SS_NOPREFIX: keep '&'
+      this.txtInfo.Value   := "Please Wait..."
+      this.txtMetrics      := g.AddText("x0 y0 w" 230 " h" 60 " 0x80")
+      this.btnCopy         := g.AddButton("Default x0 y0 w" 80 " h" 30, "Copy")
       this.Dark(this.edFilter.Hwnd, "DarkMode_CFD") ; Color
       this.Dark(this.btnClear.Hwnd) ; Color
       this.Dark(this.btnBack.Hwnd) ; Color
@@ -600,15 +606,19 @@ class UniBrowser {
       this.grid.OnMessage(0x0201, this.OnClick.Bind(this))    ; WM_LBUTTONDOWN
       this.grid.OnMessage(0x0203, this.CopySel.Bind(this))    ; left dbl click
       this.grid.OnMessage(0x0204, this.CopySel.Bind(this))    ; right click
-      this.grid.Show("x0 y" this.S(44) " w" this.S(400) " h" this.S(300) " NoActivate")   ; after the handlers: no unhandled first paint/erase
+      this.grid.Show("x0 y" 44 " w" 400 " h" 300 " NoActivate")   ; after the handlers: no unhandled first paint/erase
       ; Create the window on the active monitor (hidden), then center it in that monitor's work area
-      w := this.LoadDim("Width", 960, this.S(420)), h := this.LoadDim("Height", 660, this.S(300))
+      ; LoadDim returns DPI-independent units: with +DPIScale, Show scales them by the window's own DPI
+      w := this.LoadDim("Width", 960, 480), h := this.LoadDim("Height", 660, 300)
       wa := this.MonitorWork(hMon)
       g.Show("Hide x" wa.l " y" wa.t " w" w " h" h)
+      g.Show("Hide w" w " h" h)   ; again: if that move changed the window's DPI, the first size was scaled for the old one
+      g.Opt("+MinSize640x400")
       WinGetPos(, , &ww, &wh, g.Hwnd)
       g.Show("x" wa.l + (wa.r - wa.l - ww) // 2 " y" wa.t + (wa.b - wa.t - wh) // 2)
-      this.hits := UniData.Search("", this.chkSkin.Value)   ; empty search = everything, for the initial group list
+      this.hits := this.RunSearch("")   ; empty search = everything, for the initial group list
       this.BuildGroups()
+      this.Arrange()   ; place the controls and the grid now (also syncs the DPI to the window's), so the render target is created at its final size
       this.InitD2D()
       this.Layout()
       this.ShowInfo()
@@ -815,6 +825,7 @@ class UniBrowser {
       hprops.hwnd := this.grid.Hwnd
       hprops.pixelSize.width := Max(w, 1)
       hprops.pixelSize.height := Max(h, 1)
+      hprops.presentOptions := 2   ; D2D1_PRESENT_OPTIONS_IMMEDIATELY: EndDraw does not wait for vsync
       this.rtW := w, this.rtH := h
       this.rt := D2D.CreateHwndRenderTarget(this._d2d, props, hprops)
       this.br := D2D.CreateSolidColorBrush(this.rt, this.clrGlyph)
@@ -863,10 +874,11 @@ class UniBrowser {
       n := res.Length
       lw := this.lw, hf := lw / 2   ; stroke width and half-pixel offset, in whole device pixels
       lc := this.lc
-      if cw != this.lcW || chh != this.lcH || lc.Count > 2000 {   ; layouts depend on the cell box; cap the cache size
+      if chh != this.lcH || lc.Count > 2000 {   ; layouts use a chh x chh box, so only DPI/font size invalidate them; cap the cache size
          this.ClearLayoutCache()
-         this.lcW := cw, this.lcH := chh
+         this.lcH := chh
       }
+      ox := (cw - chh) / 2   ; centers the square layout box in the cell (cw >= chh unless the grid is narrower than one cell)
 
       D2D.BeginDraw(rt)
       D2D.Clear(rt, this.clrBack)
@@ -916,8 +928,8 @@ class UniBrowser {
                D2D.DrawRectangle(rt, rect, br, lw * 1.5)
             }
 
-            ; pass 2: glyphs (color glyphs ignore the brush). Layouts are cached per entry, so a selection change
-            ; or scroll only re-draws them; they are rebuilt only for entries not seen since the last cache reset.
+            ; pass 2: glyphs (color glyphs ignore the brush). Layouts are cached per entry, so a selection change,
+            ; scroll or resize only re-draws them; they are rebuilt only for entries not seen since the last cache reset.
             D2D.SetColor(br, this.clrGlyph)
 
             ; Reset grid position
@@ -931,11 +943,11 @@ class UniBrowser {
                   s := Ch[e]
                   If Fl[e] & 2
                      s := Chr(0x25CC) s
-                  lay := D2D.CreateTextLayout(dw, s, this.PickFormat(s), cw, chh)
+                  lay := D2D.CreateTextLayout(dw, s, this.PickFormat(s), chh, chh)
                   lc[e] := c := {lay: lay, m: 0}
                }
                ; options 6 = CLIP | ENABLE_COLOR_FONT
-               D2D.DrawTextLayout(rt, col * cw, row * chh, c.lay, br, 6)
+               D2D.DrawTextLayout(rt, col * cw + ox, row * chh, c.lay, br, 6)
 
                ; Advance grid position
                If ++col = cols
@@ -955,7 +967,7 @@ class UniBrowser {
                      c.m := D2D.GetMetrics(c.lay)
                   m := c.m
                   ; Advance x line height: the box the character occupies when inserted in a string
-                  rect.left := col * cw + m.left
+                  rect.left := col * cw + ox + m.left
                   rect.top := row * chh + m.top
                   rect.right := rect.left + m.widthIncludingTrailingWhitespace
                   rect.bottom := rect.top + m.height
@@ -1125,40 +1137,58 @@ class UniBrowser {
    }
 
    /**
-    * Gui Size event: reposition the controls and grid, resize the render target and recalculate the layout.
+    * Gui Size event: lay the window out again. The event's width and height are ignored because they are in
+    * DPI-scaled units for a +DPIScale Gui; Arrange reads the real client size in pixels.
     * @param {Gui} gui The main GUI
     * @param {Integer} minMax -1 minimized, 0 restored, 1 maximized
-    * @param {Integer} w New client width
-    * @param {Integer} h New client height
+    * @param {Integer} w New client width (DPI-scaled units, unused)
+    * @param {Integer} h New client height (DPI-scaled units, unused)
     * @returns {unset?}
     */
    static OnSize(gui, minMax, w, h) {
-      ; static renderCB := this.Render.bind(this)
       If minMax = -1 {
          ; Dramatically reduce/prune memory when minimizing
          DllCall("psapi\EmptyWorkingSet", "ptr", -1)
          Return
       }
+      this.Arrange()
+   }
+
+   /**
+    * Position every control and the grid window from the 72-dpi design values, in physical pixels at the
+    * window's current DPI, then recalculate the grid layout (which also resizes the render target).
+    * Everything is absolute, so it can be called at any time: after a resize, after a DPI change, at startup.
+    * @returns {unset?}
+    */
+   static Arrange() {
+      if !this.grid
+         return
+      this.ApplyDPI(DllCall("GetDpiForWindow", "Ptr", this.main.Hwnd, "UInt"))   ; the window's DPI is the truth
+      this.ClientSize(this.main.Hwnd, &w, &h)   ; physical pixels
+      if !w || !h
+         return
       pad := this.S(8), topH := this.S(44), botH := this.S(72), mw := this.S(230)
-      navW := this.S(28), navGap := this.S(3), filterX := pad + 2 * (navW + navGap)
+      navW := this.S(28), navGap := this.S(3), rowH := this.S(28), filterX := pad + 2 * (navW + navGap)
+      chkH := this.S(15), chkY := pad + (rowH - chkH) // 2   ; fixed design height: never read back from the control
+      cpW := this.S(80)
       rx := w - pad - this.S(92), bx := rx - this.S(88), sx := bx - this.S(96)
       by := h - botH + this.S(6), bh := botH - this.S(10)
       lstW := this.S(170), gx := pad + lstW + pad   ; group list on the left, grid fills the rest
-      this.chkSkin.GetPos(, , , &ch)   ; keep the checkboxes' current height
+      midH := Max(1, h - topH - botH)
       ; Use deferred batch updates so we don't get controls wiping each other out on resize
       items := [
-         [this.btnBack,    pad, pad, navW, this.S(28)],
-         [this.btnForward, pad + navW + navGap, pad, navW, this.S(28)],
-         [this.edFilter,   filterX, pad, sx - pad - filterX - navGap - navW, this.S(28)],
-         [this.btnClear,   sx - pad - navW, pad, navW, this.S(28)],
-         [this.chkSkin,    sx, pad + this.S(4), this.S(96), ch],
-         [this.chkBounds,  bx, pad + this.S(4), this.S(88), ch],
-         [this.chkRecents, rx, pad + this.S(4), this.S(92), ch],
-         [this.lstGroup,   pad, topH, lstW, Max(1, h - topH - botH)],
-         [this.grid,       gx, topH, Max(1, w - gx), Max(1, h - topH - botH)],
-         [this.txtInfo,    pad, by, w - pad * 4 - this.S(80) - mw, bh],
-         [this.txtMetrics, w - pad * 2 - this.S(80) - mw, by, mw, bh],
-         [this.btnCopy,    w - pad - this.S(80), by, this.S(80), this.S(30)]
+         [this.btnBack,    pad, pad, navW, rowH],
+         [this.btnForward, pad + navW + navGap, pad, navW, rowH],
+         [this.edFilter,   filterX, pad, Max(1, sx - pad - filterX - navGap - navW), rowH],
+         [this.btnClear,   sx - pad - navW, pad, navW, rowH],
+         [this.chkSkin,    sx, chkY, this.S(96), chkH],
+         [this.chkBounds,  bx, chkY, this.S(88), chkH],
+         [this.chkRecents, rx, chkY, this.S(92), chkH],
+         [this.lstGroup,   pad, topH, lstW, midH],
+         [this.grid,       gx, topH, Max(1, w - gx), midH],
+         [this.txtInfo,    pad, by, Max(1, w - pad * 4 - cpW - mw), bh],
+         [this.txtMetrics, w - pad * 2 - cpW - mw, by, mw, bh],
+         [this.btnCopy,    w - pad - cpW, by, cpW, this.S(30)]
       ]
 
       hdwp := DllCall("BeginDeferWindowPos", "Int", items.Length, "Ptr")
@@ -1171,15 +1201,14 @@ class UniBrowser {
       }
       if hdwp
          DllCall("EndDeferWindowPos", "Ptr", hdwp)
-      else   ; batch failed (the handle is already invalid), fall back to individual moves
+      else   ; batch failed (the handle is already invalid): individual moves, in pixels (GuiCtrl.Move would DPI-scale them)
          for it in items
-            it[1].Move(it[2], it[3], it[4], it[5])
-      ; On Resize the internal grid
-      if (this.rt)
-         this.Layout() ; this is kinda slow, re-lays out the grid (and resizes the render target)
+            DllCall("SetWindowPos", "Ptr", it[1].Hwnd, "Ptr", 0, "Int", it[2], "Int", it[3], "Int", it[4], "Int", it[5], "UInt", 0x14)
+      if this.rt
+         this.Layout()   ; re-lays out the grid (and resizes the render target)
    }
    /**
-    * Measure an entry with DirectWrite, using the grid's text format and a cell-sized layout box.
+    * Measure an entry with DirectWrite, using the grid's text format and the same square layout box the grid draws with.
     * @param {Integer} e Entry index
     * @returns {DWRITE_TEXT_METRICS}
     */
@@ -1187,7 +1216,7 @@ class UniBrowser {
       s := UniData.Ch[e]
       if UniData.Fl[e] & 2
          s := Chr(0x25CC) s
-      lay := D2D.CreateTextLayout(this._dw, s, this.PickFormat(s), this.cellW, this.cellH)
+      lay := D2D.CreateTextLayout(this._dw, s, this.PickFormat(s), this.cellH, this.cellH)
       m := D2D.GetMetrics(lay)
       D2D.SetMaxWidth(lay, m.widthIncludingTrailingWhitespace)   ; box = the advance
       D2D.SetMaxHeight(lay, m.height)                            ; and the line height
@@ -1333,13 +1362,41 @@ class UniBrowser {
       if this.chkRecents.Value
          this.res := this.RecentList()
       else {
-         this.hits := UniData.Search(text, this.chkSkin.Value)   ; empty text = everything: feeds the group counts
+         this.hits := this.RunSearch(text)   ; empty text = everything: feeds the group counts
          this.BuildGroups()
          this.ApplyGroup()
       }
       this.Layout()
       this.ShowInfo()
       this.Render()
+   }
+
+   /**
+    * Search for text with the current hide-skin setting, as cheaply as possible:
+    * - Empty text: the full list is computed once per skin setting and reused.
+    * - Text that extends the previous search (same skin setting, no OR): every new term contains an old term, so
+    *   the new matches are a subset of the previous hits and only those are searched. Excluded when the previous
+    *   text ends in a lone "u", because that plain term can grow into a "u+" code point term, which tests the
+    *   code point text instead of the name and so is not a narrowing.
+    * - Anything else: a full search.
+    * this.hits must still hold the results for lastText (ApplySearch assigns the return value to it).
+    * @param {String} text Trimmed search string
+    * @returns {Array} Entry indexes of all matches, in data order. Treat as read-only (it may be shared).
+    */
+   static RunSearch(text) {
+      skin := this.chkSkin.Value
+      if text = "" {
+         if !this.allHits.Has(skin)
+            this.allHits[skin] := UniData.Search("", skin)
+         hits := this.allHits[skin]
+      } else if skin = this.lastSkin && this.lastText != ""
+         && SubStr(text, 1, StrLen(this.lastText)) == this.lastText
+         && !InStr(text, "OR", true) && !RegExMatch(this.lastText, "i)(^|\s)u$")
+         hits := UniData.Search(text, skin, this.hits)
+      else
+         hits := UniData.Search(text, skin)
+      this.lastText := text, this.lastSkin := skin
+      return hits
    }
 
    /**
@@ -1413,6 +1470,7 @@ class UniBrowser {
     * with its count. Emoji groups come first, then Unicode blocks in code point order (data order).
     * The selected group is kept if it still has hits, otherwise the selection falls back to All.
     * Choose does not raise the Change event, so this never re-enters OnGroup.
+    * The ListBox is only refilled when the items differ from what it already shows.
     * @returns {unset?}
     */
    static BuildGroups() {
@@ -1427,10 +1485,11 @@ class UniBrowser {
             order.Push(g)
          }
       }
-      items := ["All (" this.hits.Length ")"], keys := [""]
+      items := ["All (" this.hits.Length ")"], keys := [""], sig := items[1]
       for g in order {
          items.Push(g " (" cnt[g] ")")
          keys.Push(g)
+         sig .= "`n" items[items.Length]
       }
       pos := 1
       if this.grpSel != "" {
@@ -1444,12 +1503,18 @@ class UniBrowser {
             this.grpSel := ""
       }
       lb := this.lstGroup
+      this.grpKeys := keys
+      if sig == this.grpSig {   ; same groups and counts: keep the list, only fix the selection
+         if lb.Value != pos
+            lb.Choose(pos)
+         return
+      }
+      this.grpSig := sig
       lb.Opt("-Redraw")
       lb.Delete()
       lb.Add(items)
       lb.Choose(pos)
       lb.Opt("+Redraw")
-      this.grpKeys := keys
    }
 
    /**
@@ -1682,15 +1747,16 @@ class UniBrowser {
       SetTimer(ToolTip, -1200)
    }
    /**
-    * Read a saved client dimension (pixels) from the ini; fall back to the scaled default if missing or too small.
+    * Read a saved client dimension from the ini (stored in 72-dpi design units, see SaveSize) and convert it to
+    * the 96-dpi units a +DPIScale Gui expects, so the result does not depend on the current DPI.
     * @param {String} key "Width" or "Height"
-    * @param {Integer} def Unscaled 72-dpi default
-    * @param {Integer} min Smallest accepted pixel value
-    * @returns {Integer}
+    * @param {Integer} def Default, in 72-dpi design units
+    * @param {Integer} min Smallest accepted saved value, in 72-dpi design units
+    * @returns {Integer} Size for Gui.Show, in DPI-scaled (96-dpi) units
     */
    static LoadDim(key, def, min) {
       v := IniRead(this.ini, "Window", key, "")
-      return IsInteger(v) && this.S(v) >= min ? this.S(v) : this.S(def)
+      return Round((IsInteger(v) && v >= min ? v : def) * 96 / 72)
    }
 
    /**
@@ -1715,15 +1781,16 @@ class UniBrowser {
     * @param {String} file Path to the .ico
     * @returns {unset?}
     */
-   static SetWindowIcon(hwnd, file) {
-      for type, m in Map(1, [11, 12], 0, [49, 50]) {   ; ICON_BIG: SM_CXICON/SM_CYICON, ICON_SMALL: SM_CXSMICON/SM_CYSMICON
-         cx := DllCall("GetSystemMetricsForDpi", "Int", m[1], "UInt", this.dpi, "Int")
-         cy := DllCall("GetSystemMetricsForDpi", "Int", m[2], "UInt", this.dpi, "Int")
-         hIcon := DllCall("LoadImageW", "Ptr", 0, "Str", file, "UInt", 1, "Int", cx, "Int", cy, "UInt", 0x10, "Ptr")   ; IMAGE_ICON, LR_LOADFROMFILE
-         if hIcon
-            SendMessage(0x80, type, hIcon, hwnd)   ; WM_SETICON
-      }
-   }
+   ; static SetWindowIcon(hwnd, file) {
+   ;    for type, m in Map(1, [11, 12], 0, [49, 50]) {   ; ICON_BIG: SM_CXICON/SM_CYICON, ICON_SMALL: SM_CXSMICON/SM_CYSMICON
+   ;       cx := DllCall("GetSystemMetricsForDpi", "Int", m[1], "UInt", this.dpi, "Int")
+   ;       cy := DllCall("GetSystemMetricsForDpi", "Int", m[2], "UInt", this.dpi, "Int")
+   ;       hIcon := DllCall("LoadImageW", "Ptr", 0, "Str", file, "UInt", 1, "Int", cx, "Int", cy, "UInt", 0x10, "Ptr")   ; IMAGE_ICON, LR_LOADFROMFILE
+   ;       if hIcon
+   ;          if prev := SendMessage(0x80, type, hIcon, hwnd)   ; WM_SETICON returns the previous icon
+   ;             DllCall("DestroyIcon", "Ptr", prev)
+   ;    }
+   ; }
 }
 
 UniBrowser.Start()
