@@ -18,7 +18,7 @@ TraySetIcon(A_ScriptDir "\tray.ico")
 ; - One Direct2D HwndRenderTarget draws the visible cells only (virtual grid), so
 ;   color emoji render via DrawText + ENABLE_COLOR_FONT and scrolling stays cheap.
 ; - Nothing is shown until the filter box has text.
-; - Data (downloaded once, cached in .\UnicodeData\ - delete the folder to refresh):
+; - Data (downloaded once after asking permission, cached in .\UnicodeData\ - delete the folder to refresh):
 ;     emoji-test.txt   emoji names, groups, ZWJ/flag/skin-tone sequences
 ;     UnicodeData.txt  names for every individually named character
 ;     Blocks.txt       block names (used as the "group" for non-emoji)
@@ -31,6 +31,9 @@ TraySetIcon(A_ScriptDir "\tray.ico")
 /* TODO
  * x Detect when restored what the prior window was that had focus, then a RMB will send the key to that window
  * x Track recent selections that were copied to the clipboard and have a button to show them vs filtered. Save them to the INI file, max up to 120.
+ * x Clear button ✖ next to search window (on right) to do a ctrl-backspace (or ⎚)
+ * x Before downloading any txt files prompt the user for permission, show splash screen while downloading
+ * - 
 */
 
 /**
@@ -54,24 +57,36 @@ Class UniData {
 
    ; Fl bit 1 = skin-tone variant, bit 2 = combining mark (drawn on a dotted circle)
 
+   ; Data files: [cache file name, URL, required]. Optional files only improve names/keywords/groups.
+   Static Sources := [
+      ["emoji-test.txt", "https://www.unicode.org/Public/emoji/latest/emoji-test.txt", true],
+      ["UnicodeData.txt", "https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt", true],
+      ["Blocks.txt", "https://www.unicode.org/Public/UCD/latest/ucd/Blocks.txt", false],
+      ["annotations-en.json", "https://raw.githubusercontent.com/unicode-org/cldr-json/main/cldr-json/cldr-annotations-full/annotations/en/annotations.json", false],
+      ["annotations-derived-en.json", "https://raw.githubusercontent.com/unicode-org/cldr-json/main/cldr-json/cldr-annotations-derived-full/annotationsDerived/en/annotations.json", false]
+   ]
+
    /**
-    * Download (first run only) and parse every data source, then build the combined search strings.
-    * Shows a tooltip while working. Call once before using Search.
-    * @throws {Error} If a required data file cannot be downloaded
-    * @returns {unset?}
+    * Download (first run only, with the user's permission) and parse every data source, then build the combined
+    * search strings. Shows a tooltip while parsing. Call once before using Search.
+    * @returns {unset?} Exits the app if a required data file is not available
     */
    Static Load() {
       DirCreate(this.Dir)
-      ToolTip("Loading Unicode data (first run downloads ~4 MB)...")
-      ucd := "https://www.unicode.org/Public/UCD/latest/ucd/"
-      cldr := "https://raw.githubusercontent.com/unicode-org/cldr-json/main/cldr-json/"
-      fEmoji := this.Fetch("emoji-test.txt", "https://www.unicode.org/Public/emoji/latest/emoji-test.txt")
-      fUni := this.Fetch("UnicodeData.txt", ucd "UnicodeData.txt")
-      fBlk := this.Fetch("Blocks.txt", ucd "Blocks.txt", false)
-      fAnn := this.Fetch("annotations-en.json"
-         , cldr "cldr-annotations-full/annotations/en/annotations.json", false)
-      fDer := this.Fetch("annotations-derived-en.json"
-         , cldr "cldr-annotations-derived-full/annotationsDerived/en/annotations.json", false)
+      need := []
+      For s in this.Sources {
+         If this.Cached(s[1]) = ""
+            need.Push(s)
+      }
+      If need.Length
+         this.DownloadAll(need)   ; asks first, shows status; exits the app if a required file is unavailable
+
+      ToolTip("Loading Unicode data...")
+      fEmoji := this.Cached("emoji-test.txt")
+      fUni := this.Cached("UnicodeData.txt")
+      fBlk := this.Cached("Blocks.txt")
+      fAnn := this.Cached("annotations-en.json")
+      fDer := this.Cached("annotations-derived-en.json")
 
       this.LoadEmoji(fEmoji)
       this.LoadUnicodeData(fUni, fBlk)
@@ -87,25 +102,126 @@ Class UniData {
    }
 
    /**
-    * Return the cached copy of a data file, downloading it first if it is missing or empty.
+    * Path of a cached data file.
     * @param {String} name File name inside the cache folder (UniData.Dir)
-    * @param {String} url URL to download from when not cached
-    * @param {Boolean} [required=true] Throw on download failure; otherwise return an empty string
-    * @throws {Error} If the download fails and required is true
-    * @returns {String} Full path of the cached file, or "" if an optional download failed
+    * @returns {String} Full path, or "" if the file is missing or empty
     */
-   Static Fetch(name, url, required := true) {
+   Static Cached(name) {
       f := this.Dir "\" name
-      If FileExist(f) && FileGetSize(f) > 0
-         Return f
-      hr := DllCall("urlmon\URLDownloadToFileW", "Ptr", 0, "Str", url, "Str", f, "UInt", 0, "Ptr", 0, "UInt")
-      If hr != 0 || !FileExist(f) || FileGetSize(f) = 0 {
-         Try FileDelete(f)
-         If required
-            Throw Error("Download failed: " url)
-         Return ""
+      Return FileExist(f) && FileGetSize(f) > 0 ? f : ""
+   }
+
+   /**
+    * Ask permission, then download the missing data files one at a time while a splash window shows the
+    * status of each (with elapsed seconds, so a slow network is visibly still working). The splash has a
+    * Cancel button that aborts the current download and skips the rest.
+    * If permission is refused or a required file could not be obtained, the app exits.
+    * Declining when only optional files are missing just continues without them.
+    * @param {Array} need Entries from Sources that are not cached yet
+    * @returns {unset?}
+    */
+   Static DownloadAll(need) {
+      names := "", anyRequired := false
+      For s in need {
+         names .= "`n   " s[1] (s[3] ? "" : "   (optional)")
+         If s[3]
+            anyRequired := true
       }
-      Return f
+      msg := "Unicode Browser needs to download " (need.Length = 1 ? "this data file" : "these data files")
+         . " (about 4 MB in total on a first run) from unicode.org and github.com:`n" names
+         . "`n`nThey will be saved in:`n" this.Dir "`n`nDownload now?"
+      If MsgBox(msg, "Unicode Browser", "YesNo Icon?") != "Yes" {
+         If anyRequired {
+            MsgBox("The required Unicode data files are not available, so Unicode Browser cannot start.", "Unicode Browser", "Iconx")
+            ExitApp
+         }
+         Return
+      }
+
+      ; Splash window: one row per file with its status
+      g := Gui("+AlwaysOnTop -SysMenu", "Unicode Browser - Downloading")
+      g.BackColor := UniBrowser.clrBack
+      g.SetFont("s10 cE6E6E6", "Segoe UI")
+      g.MarginX := 16, g.MarginY := 12
+      g.AddText("w500", "Downloading Unicode data. This can take a while on a slow connection, please wait...")
+      stat := []
+      For s in need {
+         g.AddText("xm y+8 w230", s[1])
+         stat.Push(g.AddText("x+10 yp w260", "Waiting"))
+      }
+      btn := g.AddButton("xm y+16 w90", "Cancel")
+      state := {cancel: false}
+      btn.OnEvent("Click", (*) => state.cancel := true)
+      try DllCall("dwmapi\DwmSetWindowAttribute", "Ptr", g.Hwnd, "Int", 20, "Int*", 1, "Int", 4, "Int")   ; dark title bar
+      try DllCall("uxtheme\SetWindowTheme", "Ptr", btn.Hwnd, "Str", "DarkMode_Explorer", "Ptr", 0)
+      g.Show()
+
+      For i, s in need {
+         If state.cancel {
+            stat[i].Text := "Skipped"
+            Continue
+         }
+         stat[i].Text := "Downloading... 0 s"
+         ok := this.HttpGet(s[2], this.Dir "\" s[1], stat[i], state)
+         stat[i].Text := ok ? "Done" : (state.cancel ? "Cancelled" : (s[3] ? "Failed" : "Failed (optional, skipped)"))
+      }
+      g.Destroy()
+
+      bad := ""
+      For s in need {
+         If s[3] && this.Cached(s[1]) = ""
+            bad .= "`n   " s[1]
+      }
+      If bad != "" {
+         MsgBox((state.cancel ? "The download was cancelled." : "The download failed. Check your network connection and try again.")
+            . "`n`nRequired files missing:" bad, "Unicode Browser", "Iconx")
+         ExitApp
+      }
+   }
+
+   /**
+    * Download a URL to a file without blocking the GUI: the request is asynchronous and the wait loop uses
+    * Sleep, so the splash stays responsive (Cancel works) and no fixed overall time limit applies.
+    * Per-operation network timeouts are generous for slow links. The file is only written once the whole
+    * response has arrived, and removed again on failure.
+    * @param {String} url Source URL
+    * @param {String} file Destination path
+    * @param {Gui.Text} ctl Status control updated with the elapsed seconds
+    * @param {Object} state Object whose cancel property is set to true by the Cancel button
+    * @returns {Boolean} True if the file was downloaded and saved
+    */
+   Static HttpGet(url, file, ctl, state) {
+      t0 := A_TickCount, last := 0
+      try {
+         whr := ComObject("WinHttp.WinHttpRequest.5.1")
+         whr.SetTimeouts(30000, 30000, 60000, 120000)   ; resolve, connect, send, receive (ms)
+         whr.Open("GET", url, true)
+         whr.Send()
+         While !whr.WaitForResponse(0) {
+            If state.cancel {
+               whr.Abort()
+               Return false
+            }
+            If (sec := (A_TickCount - t0) // 1000) != last {
+               last := sec
+               ctl.Text := "Downloading... " sec " s"
+            }
+            Sleep(100)
+         }
+         If whr.Status != 200
+            Return false
+         body := whr.ResponseBody   ; SAFEARRAY of bytes
+         size := body.MaxIndex() + 1
+         If size <= 0
+            Return false
+         pData := NumGet(ComObjValue(body), 8 + A_PtrSize, "Ptr")   ; SAFEARRAY.pvData
+         f := FileOpen(file, "w")
+         f.RawWrite(pData, size)
+         f.Close()
+         Return true
+      }
+      Try FileDelete(file)
+      Return false
    }
 
    /**
@@ -294,23 +410,25 @@ class UniBrowser {
    static dpi := 96, sc := 96 / 72, lw := 1, starting := true   ; dpi/sc/lw are set from the active monitor in Start
    static fFilter := 0, fUI := 0                                  ; HFONTs rebuilt on every DPI change
    static ini := A_ScriptDir "\UnicodeBrowser.ini"
-   static main := 0, grid := 0, edFilter := 0, btnBack := 0, btnForward := 0
+   static main := 0, grid := 0, edFilter := 0, btnClear := 0, btnBack := 0, btnForward := 0
    static chkSkin := 0, chkBounds := 0, chkRecents := 0, txtInfo := 0, txtMetrics := 0, btnCopy := 0
    static tmr := 0
    static searchHistory := [], historyPos := 0, navigatingHistory := false
    static recent := [], maxRecent := 100   ; copy history: entry indexes, oldest first, latest at the end
    static lstGroup := 0, grpKeys := [""], grpSel := "", hits := [], filterText := ""   ; hits = search hits before the group filter
-   static _d2d := 0, _dw := 0, rt := 0, br := 0, fmt := 0, fmtEmoji := 0
+   static _d2d := 0, _dw := 0, rt := 0, br := 0, fmt := 0, fmtEmoji := 0, rtW := 0, rtH := 0
+   static tipTmr := 0, tipT0 := 0, tipShown := false
    static rendering := false, again := false   ; Render re-entrancy guard
    static lc := Map(), lcW := 0, lcH := 0       ; text layout cache: entry index -> {lay, m}, built for a cellW x cellH
    static rect := D2D1_RECT_F()
    ; Grid theme colors as 0xRRGGBB. _Color builds each one once as a D2D1_COLOR_F, ready for the D2D calls.
-   static clrBack       := this._Color("0x202020")   ; grid background
-   static clrCellBorder := this._Color("0x3A3A3A")   ; cell outlines
-   static clrSelFill    := this._Color("0x264F78")   ; selected cell fill
-   static clrSelBorder  := this._Color("0x0078D7")   ; selected cell outline
-   static clrGlyph      := this._Color("0xEBEBEB")   ; glyph color (color emoji ignore it)
-   static clrBounds     := this._Color("0xa35027")   ; text-box outline
+   static clrBack       := this._FloatColor(this.hxClrBack := "0x202020")   ; grid background
+   static clrCellBorder := this._FloatColor("0x3A3A3A")   ; cell outlines
+   static clrSelFill    := this._FloatColor("0x264F78")   ; selected cell fill
+   static clrSelBorder  := this._FloatColor("0x0078D7")   ; selected cell outline
+   static clrGlyph      := this._FloatColor("0xEBEBEB")   ; glyph color (color emoji ignore it)
+   static clrBounds     := this._FloatColor("0xa35027")   ; text-box outline
+   static clrEntry      := "0x2D2D2D"
    static res           := [],   sel     := 0, top := 0, cols := 1, rows := 0, page := 1
    static cellW         := 56.0, cellH   := 56
    static FontSize      := 26
@@ -373,6 +491,7 @@ class UniBrowser {
          , "UInt", 0, "UInt", 1, "UInt", 0, "UInt", 0, "UInt", 5, "UInt", 0, "Str", this.Font, "Ptr")   ; CLEARTYPE_QUALITY
       this.fFilter := mk(14, 700), this.fUI := mk(10, 400)
       SendMessage(0x30, this.fFilter, 1, this.edFilter)   ; WM_SETFONT
+      SendMessage(0x30, this.fFilter, 1, this.btnClear)
       SendMessage(0x30, this.fFilter, 1, this.btnBack)
       SendMessage(0x30, this.fFilter, 1, this.btnForward)
       for c in [this.chkSkin, this.chkBounds, this.chkRecents, this.lstGroup, this.txtInfo, this.txtMetrics, this.btnCopy]
@@ -422,28 +541,31 @@ class UniBrowser {
 
       this.InitDark() ; Color
       this.Gui := g := this.main := Gui("+Resize -DPIScale +MinSize" this.S(480) "x" this.S(300), "Unicode Browser")
-      g.BackColor := "202020" ; Color
+      this.SetWindowIcon(g.Hwnd, A_ScriptDir "\tray.ico")
+      g.BackColor := this.hxClrBack ; Color
       this.DarkTitle(g.Hwnd)
       g.SetFont("s14 bold cE6E6E6", this.Font)
       pad := this.S(8), navW := this.S(28), navGap := this.S(3)
       forwardX := pad + navW + navGap, filterX := pad + 2 * (navW + navGap)
       this.btnBack := g.AddButton("x" pad " y" pad " w" navW " h" this.S(28) " -Wrap", "◀")
       this.btnForward := g.AddButton("x" forwardX " y" pad " w" navW " h" this.S(28) " -Wrap", "▶")
-      this.edFilter := g.AddEdit("x" filterX " y" pad " w" this.S(300) " h" this.S(28) " Background2D2D2D")
+      this.edFilter := g.AddEdit("x" filterX " y" pad " w" this.S(300) " h" this.S(28) " Background" this.clrEntry)
       SendMessage(0x1501, true, StrPtr("Search name, keyword, group or u+hex"), this.edFilter)   ; EM_SETCUEBANNER
+      this.btnClear := g.AddButton("x" (filterX + this.S(300) + navGap) " y" pad " w" navW " h" this.S(28) " -Wrap", "✖")   ; positioned in OnSize
       g.SetFont("s10 Norm cE6E6E6", this.Font)
       this.chkSkin := g.AddCheckbox("x0 y0 w" this.S(100), "Hide skin tones")
       this.chkSkin.Value := IniRead(this.ini,"Settings","Hide Skin Tones", true)
       this.chkBounds := g.AddCheckbox("x0 y0 w" this.S(100), "Show bounds")
       this.chkBounds.Value := IniRead(this.ini,"Settings","Show Bounds", true)
       this.chkRecents := g.AddCheckbox("x0 y0 w" this.S(92), "Show recents")
-      this.lstGroup := g.AddListBox("x0 y0 w" this.S(170) " h" this.S(200) " Background2D2D2D +0x100")   ; 0x100 = LBS_NOINTEGRALHEIGHT
+      this.lstGroup := g.AddListBox("x0 y0 w" this.S(170) " h" this.S(200) " Background" this.clrEntry " +0x100")   ; 0x100 = LBS_NOINTEGRALHEIGHT
       this.txtInfo := g.AddText("x0 y0 w" this.S(75) " h" this.S(60) " 0x80")   ; SS_NOPREFIX: keep '&'
       this.txtInfo.Value := "Please Wait..."
       this.txtMetrics := g.AddText("x0 y0 w" this.S(230) " h" this.S(60) " 0x80")
       this.btnCopy := g.AddButton("Default x0 y0 w" this.S(80) " h" this.S(30), "Copy")
       this.ApplyFonts()   ; the SetFont calls above only supply the colors; real sizes come from the monitor DPI
       this.Dark(this.edFilter.Hwnd, "DarkMode_CFD") ; Color
+      this.Dark(this.btnClear.Hwnd) ; Color
       this.Dark(this.btnBack.Hwnd) ; Color
       this.Dark(this.btnForward.Hwnd) ; Color
       this.Dark(this.chkSkin.Hwnd) ; Color
@@ -452,6 +574,7 @@ class UniBrowser {
       this.Dark(this.chkRecents.Hwnd) ; Color
       this.Dark(this.lstGroup.Hwnd) ; Color
       this.edFilter.OnEvent("Change", this.OnFilter.Bind(this))
+      this.btnClear.OnEvent("Click", this.OnClearClick.Bind(this))
       this.btnBack.OnEvent("Click", this.NavigateHistory.Bind(this, -1))
       this.btnForward.OnEvent("Click", this.NavigateHistory.Bind(this, 1))
       this.txtInfo.OnEvent("Click", this.pickGroup.Bind(this))
@@ -468,15 +591,16 @@ class UniBrowser {
 
       ; Gui has no +VScroll option (that is control-only). Use the raw WS_VSCROLL style (0x200000) so the
       ; non-client scrollbar exists from creation; SetScrollInfo alone adds it without recalculating the frame.
-      this.grid := Gui("-Caption +Parent" g.Hwnd " -DPIScale")
+      this.grid := Gui("-Caption +Parent" g.Hwnd " -DPIScale +0x200000")   ; +0x200000 = WS_VSCROLL, present from creation
+      this.grid.BackColor := this.hxClrBack   ; fallback so any default erase is dark, never white
       this.Dark(this.grid.Hwnd)   ; dark scrollbar
-      this.grid.Show("x0 y" this.S(44) " w" this.S(400) " h" this.S(300) " NoActivate")
       this.grid.OnMessage(0x000F, this.OnPaint.Bind(this))    ; WM_PAINT
       this.grid.OnMessage(0x0014, this.OnErase.Bind(this))    ; WM_ERASEBKGND
       this.grid.OnMessage(0x0115, this.OnVScroll.Bind(this))  ; WM_VSCROLL
       this.grid.OnMessage(0x0201, this.OnClick.Bind(this))    ; WM_LBUTTONDOWN
       this.grid.OnMessage(0x0203, this.CopySel.Bind(this))    ; left dbl click
       this.grid.OnMessage(0x0204, this.CopySel.Bind(this))    ; right click
+      this.grid.Show("x0 y" this.S(44) " w" this.S(400) " h" this.S(300) " NoActivate")   ; after the handlers: no unhandled first paint/erase
       ; Create the window on the active monitor (hidden), then center it in that monitor's work area
       w := this.LoadDim("Width", 960, this.S(420)), h := this.LoadDim("Height", 660, this.S(300))
       wa := this.MonitorWork(hMon)
@@ -490,11 +614,12 @@ class UniBrowser {
       this.ShowInfo()
       this.Render()
       this.edFilter.Focus()
-      this.grid.opt("+0x200000")
       OnExit(this.SaveSize.Bind(this))
       this.starting := false
+      DllCall("InvalidateRect", "Ptr", this.grid.Hwnd, "Ptr", 0, "Int", false)   ; one more paint now that everything has settled
       OnMessage(0x404, this.TrayMessage.Bind(this))
-
+      this.tipTmr := ObjBindMethod(this, "TipTick")
+      OnMessage(0x200, this.OnTipMove.Bind(this))   ; WM_MOUSEMOVE
    }
    /**
     * Tray message callback when icon is clicked, toggle the window visibility
@@ -571,7 +696,7 @@ class UniBrowser {
     * @param {Number} [a=1.0] Alpha, 0.0 to 1.0.
     * @returns {Buffer} 16-byte D2D1_COLOR_F structure.
     */
-   static _Color(rgb, a := 1.0) {
+   static _FloatColor(rgb, a := 1.0) {
       rgb := this._ToRGB(rgb)
       c := D2D1_COLOR_F()
       c.r := (rgb >> 16 & 0xFF) / 255
@@ -690,6 +815,7 @@ class UniBrowser {
       hprops.hwnd := this.grid.Hwnd
       hprops.pixelSize.width := Max(w, 1)
       hprops.pixelSize.height := Max(h, 1)
+      this.rtW := w, this.rtH := h
       this.rt := D2D.CreateHwndRenderTarget(this._d2d, props, hprops)
       this.br := D2D.CreateSolidColorBrush(this.rt, this.clrGlyph)
    }
@@ -878,14 +1004,39 @@ class UniBrowser {
     * @returns {unset?}
     */
    static Layout() {
+      ; Showing/hiding the scrollbar (UpdateScroll) changes the client width, so measure again afterwards
+      ; and redo the layout once if it moved.
+      Loop 2 {
+         this.ClientSize(this.grid.Hwnd, &w, &h)
+         this.cellH := this.S(This.BlockSize)
+         this.cols  := Max(1, w // this.S(this.BlockSize))
+         this.cellW := w / this.cols
+         this.rows  := Ceil(this.res.Length / this.cols)
+         this.page  := Max(1, h // this.cellH)
+         this.top   := Max(0, Min(this.top, this.rows - this.page))
+         this.UpdateScroll()
+         this.ClientSize(this.grid.Hwnd, &w2, &h2)
+         if w2 = w && h2 = h
+            break
+      }
+      this.SyncRT()
+   }
+
+   /**
+    * Resize the render target if the grid's client size no longer matches it. A render target that is
+    * out of step with its window leaves the uncovered part showing the window's own (white) background.
+    * @returns {unset?}
+    */
+   static SyncRT() {
+      if !this.rt
+         return
       this.ClientSize(this.grid.Hwnd, &w, &h)
-      this.cellH := this.S(This.BlockSize)
-      this.cols  := Max(1, w // this.S(this.BlockSize))
-      this.cellW := w / this.cols
-      this.rows  := Ceil(this.res.Length / this.cols)
-      this.page  := Max(1, h // this.cellH)
-      this.top   := Max(0, Min(this.top, this.rows - this.page))
-      this.UpdateScroll()
+      if w = this.rtW && h = this.rtH
+         return
+      sz := D2D1_SIZE_U()
+      sz.width := Max(w, 1), sz.height := Max(h, 1)
+      D2D.Resize(this.rt, sz)
+      this.rtW := w, this.rtH := h
    }
 
    /**
@@ -998,7 +1149,8 @@ class UniBrowser {
       items := [
          [this.btnBack,    pad, pad, navW, this.S(28)],
          [this.btnForward, pad + navW + navGap, pad, navW, this.S(28)],
-         [this.edFilter,   filterX, pad, sx - pad - filterX, this.S(28)],
+         [this.edFilter,   filterX, pad, sx - pad - filterX - navGap - navW, this.S(28)],
+         [this.btnClear,   sx - pad - navW, pad, navW, this.S(28)],
          [this.chkSkin,    sx, pad + this.S(4), this.S(96), ch],
          [this.chkBounds,  bx, pad + this.S(4), this.S(88), ch],
          [this.chkRecents, rx, pad + this.S(4), this.S(92), ch],
@@ -1023,13 +1175,8 @@ class UniBrowser {
          for it in items
             it[1].Move(it[2], it[3], it[4], it[5])
       ; On Resize the internal grid
-      if (this.rt) {
-         this.ClientSize(this.grid.Hwnd, &gw, &gh)
-         sz := D2D1_SIZE_U()
-         sz.width := Max(gw, 1), sz.height := Max(gh, 1)
-         D2D.Resize(this.rt, sz)
-         this.Layout() ; this is kinda slow, re-lays out the grid
-      }
+      if (this.rt)
+         this.Layout() ; this is kinda slow, re-lays out the grid (and resizes the render target)
    }
    /**
     * Measure an entry with DirectWrite, using the grid's text format and a cell-sized layout box.
@@ -1142,6 +1289,15 @@ class UniBrowser {
          this.navigatingHistory := false
       }
       this.ApplySearch("")
+   }
+
+   /**
+    * Clear button Click handler: same as Ctrl+Backspace in the filter box, then return focus to it.
+    * @returns {unset?}
+    */
+   static OnClearClick(*) {
+      this.ClearFilter()
+      this.edFilter.Focus()
    }
 
    /**
@@ -1337,7 +1493,7 @@ class UniBrowser {
     */
    static OnRecents(*) {
       SetTimer(this.tmr, 0)
-      this.edFilter.Enabled := this.lstGroup.Enabled := !this.chkRecents.Value
+      this.edFilter.Enabled := this.lstGroup.Enabled := this.btnClear.Enabled := !this.chkRecents.Value
       this.UpdateHistoryButtons()
       this.Refilter()
       if this.edFilter.Enabled
@@ -1443,6 +1599,37 @@ class UniBrowser {
       }
    }
    /**
+    * Global WM_MOUSEMOVE handler: when the mouse is over txtInfo, start the tooltip timer.
+    * @param {Integer} wParam Unused
+    * @param {Integer} lParam Unused
+    * @param {Integer} msg Message number
+    * @param {Integer} hwnd Window or control that received the message
+    * @returns {unset?}
+    */
+   static OnTipMove(wParam, lParam, msg, hwnd) {
+      if hwnd != this.txtInfo.Hwnd || this.tipT0
+         return
+      this.tipT0 := A_TickCount, this.tipShown := false
+      SetTimer(this.tipTmr, 50)
+   }
+
+   /**
+    * Timer: show the tip once the mouse has rested on txtInfo for 400 ms, and remove it when the mouse leaves.
+    * Uses tooltip number 2 so it never collides with the "Copied" tooltip.
+    * @returns {unset?}
+    */
+   static TipTick() {
+      MouseGetPos(, , , &h, 2)
+      if h != this.txtInfo.Hwnd {
+         SetTimer(this.tipTmr, 0)
+         ToolTip(, , , 2)
+         this.tipT0 := 0
+      } else if !this.tipShown && A_TickCount - this.tipT0 >= 400 {
+         this.tipShown := true
+         ToolTip("Click: filter by this character's group`nRight-click: copy the code point", , , 2)
+      }
+   }   
+   /**
     * When clicking the text at the bottom, filter on the group
     * @param GuiOrCtrlObj Gui control
     * @returns {unset?} 
@@ -1451,7 +1638,7 @@ class UniBrowser {
       If this.sel {
          i := this.res[this.sel]
          group := UniData.Gr[i]
-         this.lstGroup.Enabled := this.edFilter.Enabled := true
+         this.lstGroup.Enabled := this.edFilter.Enabled := this.btnClear.Enabled := true
          this.edFilter.value := group
          If (this.chkRecents) {
             ; Want history to point at the last entry
@@ -1522,6 +1709,21 @@ class UniBrowser {
          IniWrite(this.FontSize, this.ini, "Settings", "Font Size")
       }
    }   
+   /**
+    * Set a window's title bar / taskbar icon from an .ico file, at the sizes the current DPI needs.
+    * @param {Integer} hwnd Window handle
+    * @param {String} file Path to the .ico
+    * @returns {unset?}
+    */
+   static SetWindowIcon(hwnd, file) {
+      for type, m in Map(1, [11, 12], 0, [49, 50]) {   ; ICON_BIG: SM_CXICON/SM_CYICON, ICON_SMALL: SM_CXSMICON/SM_CYSMICON
+         cx := DllCall("GetSystemMetricsForDpi", "Int", m[1], "UInt", this.dpi, "Int")
+         cy := DllCall("GetSystemMetricsForDpi", "Int", m[2], "UInt", this.dpi, "Int")
+         hIcon := DllCall("LoadImageW", "Ptr", 0, "Str", file, "UInt", 1, "Int", cx, "Int", cy, "UInt", 0x10, "Ptr")   ; IMAGE_ICON, LR_LOADFROMFILE
+         if hIcon
+            SendMessage(0x80, type, hIcon, hwnd)   ; WM_SETICON
+      }
+   }
 }
 
 UniBrowser.Start()
