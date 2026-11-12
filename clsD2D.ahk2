@@ -1,4 +1,4 @@
-; clsD2D: static COM method wrappers for Direct2D / DirectWritee
+; clsD2D: static COM method wrappers for Direct2D / DirectWrite
 ; Mostly created by Claude AI
 #Requires AutoHotkey v2.1-
 struct DWRITE_TEXT_METRICS {
@@ -363,9 +363,9 @@ class D2D {
       return m
    }
    /**
-    * IDWriteTextLayout::GetOverhangMetrics (vtable 61). Measures the overhang of the bounding box
+    * IDWriteTextLayout::GetOverhangMetrics (vtable 61). Measures how far the glyph ink extends past the layout box.
     * @param {Integer} layout IDWriteTextLayout pointer.
-    * @returns {DWRITE_TEXT_METRICS} Sizes in DIPs; .width is the natural text width without trailing whitespace.
+    * @returns {DWRITE_OVERHANG_METRICS} Distances in DIPs; positive values mean the ink extends beyond that edge.
     * @throws {OSError} If the call fails.
     */
    static GetOverhangMetrics(layout) {
