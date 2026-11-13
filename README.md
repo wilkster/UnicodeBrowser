@@ -2,7 +2,7 @@
 
 A fast, searchable Unicode and emoji browser for Windows, written in AutoHotkey v2.1. Type a word, see every matching character, and copy the one you want to the clipboard by double clicking it.
 
-![Unicode Browser searching for "face"](Assets/ScreenShot.png)
+![Unicode Browser searching for "face"](Snips/ScreenShot.png)
 
 ## Features
 
