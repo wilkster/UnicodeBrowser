@@ -439,6 +439,7 @@ class UniBrowser {
    static FontSize      := 26
    Static BlockSize     := 56
    Static Font          := "Segoe UI"
+   ; Static Font          := "Symbola"
    Static EmojiFont     := "Segoe UI Emoji"   ; primary family for emoji-range strings (skips the fallback search)
    /**
     * Scale a 72-dpi design value to the current screen DPI.
@@ -763,6 +764,7 @@ class UniBrowser {
          throw OSError(hr, , "DWriteCreateFactory")
 
       this._dw := d
+      this.MakeFallback()
       this.MakeFormat()
       this.MakeRT()
    }
@@ -797,11 +799,73 @@ class UniBrowser {
     * @returns {Integer} IDWriteTextFormat pointer. The caller owns it.
     */
    static NewFormat(family) {
+      static iid := 0
       f := D2D.CreateTextFormat(this._dw, family, this.S(this.FontSize))
       D2D.SetTextAlignment(f, 2)        ; center
       D2D.SetParagraphAlignment(f, 2)   ; center
       D2D.SetWordWrapping(f, 1)         ; no wrap
+      if this._fb {
+         if !iid
+            iid := Buffer(16), DllCall("ole32\CLSIDFromString", "Str", "{5F174B49-0D8B-4CFB-8BCA-F1CCE9D06C67}", "Ptr", iid)   ; IDWriteTextFormat1
+         if !ComCall(0, f, "Ptr", iid, "Ptr*", &f1 := 0, "Int") {   ; QueryInterface
+            try ComCall(34, f1, "Ptr", this._fb)                     ; IDWriteTextFormat1::SetFontFallback
+            ObjRelease(f1)
+         }
+      }
       return f
+   }
+
+   static _fb := 0   ; IDWriteFontFallback: the system fallback plus the ini's extra fonts (0 = DirectWrite's default)
+
+   /**
+    * Build a custom font fallback from the "Fallback Fonts" ini setting (comma-separated family names, e.g.
+    * "Symbola, Noto Sans Symbols 2"). DirectWrite's system fallback only knows a fixed list of Windows fonts, so
+    * fonts the user installs are never used for substitution unless they are added here.
+    * By default the extra fonts are tried after the system mappings (last resort); with "Fallback First=1" they
+    * are tried before them. Either way the format's own font (Segoe UI) still wins for characters it has.
+    * Needs Windows 8.1+ (IDWriteFactory2); on failure the default fallback is left in place.
+    * @returns {unset?}
+    */
+   static MakeFallback() {
+      list := IniRead(this.ini, "Settings", "Fallback Fonts", "`n")
+      if list = "`n" {   ; key absent: write an empty one so it can be found and edited
+         IniWrite("", this.ini, "Settings", "Fallback Fonts")
+         return
+      }
+      if Trim(list) = ""
+         return
+      bufs := []
+      for n in StrSplit(list, ",", " `t")
+         if n != ""
+            b := Buffer(StrPut(n)), StrPut(n, b), bufs.Push(b)
+      if !bufs.Length   ; only separators, e.g. " , "
+         return
+      ptrs := Buffer(bufs.Length * A_PtrSize)
+      for b in bufs
+         NumPut("Ptr", b.Ptr, ptrs, (A_Index - 1) * A_PtrSize)
+      first := IniRead(this.ini, "Settings", "Fallback First", 0)
+
+      f2 := bld := sys := 0
+      try {
+         iid := Buffer(16)
+         DllCall("ole32\CLSIDFromString", "Str", "{0439FC60-CA44-4994-8DEE-3A9AF7B732EC}", "Ptr", iid)   ; IDWriteFactory2
+         ComCall(0, this._dw, "Ptr", iid, "Ptr*", &f2)           ; QueryInterface
+         ComCall(26, f2, "Ptr*", &sys)                           ; IDWriteFactory2::GetSystemFontFallback
+         ComCall(27, f2, "Ptr*", &bld)                           ; IDWriteFactory2::CreateFontFallbackBuilder
+         rng := Buffer(8), NumPut("UInt", 0, "UInt", 0x10FFFF, rng)   ; DWRITE_UNICODE_RANGE: all of Unicode
+         if !first
+            ComCall(4, bld, "Ptr", sys)                          ; AddMappings(system fallback)
+         ComCall(3, bld, "Ptr", rng, "UInt", 1                   ; AddMapping(ranges, count,
+            , "Ptr", ptrs, "UInt", bufs.Length                   ;   families, count,
+            , "Ptr", 0, "Ptr", 0, "Ptr", 0, "Float", 1.0)        ;   system collection, no locale, no base family, scale 1)
+         if first
+            ComCall(4, bld, "Ptr", sys)
+         ComCall(5, bld, "Ptr*", &fb := 0)                       ; CreateFontFallback
+         this._fb := fb
+      }
+      for p in [sys, bld, f2]
+         if p
+            ObjRelease(p)
    }
 
    /**
@@ -1209,20 +1273,124 @@ class UniBrowser {
    }
    /**
     * Measure an entry with DirectWrite, using the grid's text format and the same square layout box the grid draws with.
+    * Also reports the font(s) DirectWrite actually picked for it, font fallback included.
     * @param {Integer} e Entry index
-    * @returns {DWRITE_TEXT_METRICS}
+    * @returns {Object} {M: DWRITE_TEXT_METRICS, O: DWRITE_OVERHANG_METRICS, F: font family name(s)}
     */
    static CharMetrics(e) {
       s := UniData.Ch[e]
+      skip := 0
       if UniData.Fl[e] & 2
-         s := Chr(0x25CC) s
+         s := Chr(0x25CC) s, skip := 1   ; ignore the dotted-circle carrier when naming the font
       lay := D2D.CreateTextLayout(this._dw, s, this.PickFormat(s), this.cellH, this.cellH)
+      f := this.FontsUsed(lay, skip)
       m := D2D.GetMetrics(lay)
       D2D.SetMaxWidth(lay, m.widthIncludingTrailingWhitespace)   ; box = the advance
       D2D.SetMaxHeight(lay, m.height)                            ; and the line height
       o := D2D.GetOverhangMetrics(lay)
       ObjRelease(lay)
-      return {M: m, O: o}
+      return {M: m, O: o, F: f}
+   }
+
+   ; ---------------------------------------------------------------- font detection
+
+   static _fr := 0, _frVt := 0, _frNames := [], _frSkip := 0, _coll := 0
+
+   /**
+    * Font family name(s) DirectWrite actually uses to draw a text layout, font fallback included. The layout is
+    * "drawn" through a minimal custom IDWriteTextRenderer that paints nothing; DrawGlyphRun receives the font face
+    * of each glyph run. A run whose glyphs are all glyph 0 (.notdef, the empty box) is marked "(missing)".
+    * @param {Integer} lay IDWriteTextLayout pointer
+    * @param {Integer} skip Leading UTF-16 units to ignore (e.g. a dotted-circle carrier)
+    * @returns {String} e.g. "Segoe UI Symbol", or "Segoe UI + Cambria Math"
+    */
+   static FontsUsed(lay, skip := 0) {
+      if !this._fr {
+         vt := this._frVt := Buffer(10 * A_PtrSize)
+         cbs := [
+            CallbackCreate(this._FrQI.Bind(this), , 3),                                       ; QueryInterface
+            CallbackCreate((p) => 1, , 1),                                                    ; AddRef (static object)
+            CallbackCreate((p) => 1, , 1),                                                    ; Release
+            CallbackCreate((p, ctx, pb) => (NumPut("Int", 1, pb), 0), , 3),                   ; IsPixelSnappingDisabled
+            CallbackCreate((p, ctx, pm) => (NumPut("Float", 1, "Float", 0, "Float", 0, "Float", 1, "Float", 0, "Float", 0, pm), 0), , 3),  ; GetCurrentTransform
+            CallbackCreate((p, ctx, pf) => (NumPut("Float", 1, pf), 0), , 3),                 ; GetPixelsPerDip
+            CallbackCreate(this._FrGlyphRun.Bind(this), , 8),                                 ; DrawGlyphRun
+            CallbackCreate((p*) => 0, , 6),                                                   ; DrawUnderline
+            CallbackCreate((p*) => 0, , 6),                                                   ; DrawStrikethrough
+            CallbackCreate((p*) => 0, , 8)                                                    ; DrawInlineObject
+         ]
+         for cb in cbs
+            NumPut("Ptr", cb, vt, (A_Index - 1) * A_PtrSize)
+         this._fr := Buffer(A_PtrSize)
+         NumPut("Ptr", vt.Ptr, this._fr)
+      }
+      if !this._coll
+         ComCall(3, this._dw, "Ptr*", &c := 0, "Int", false)   ; IDWriteFactory::GetSystemFontCollection
+         , this._coll := c
+      this._frNames := [], this._frSkip := skip
+      try ComCall(58, lay, "Ptr", 0, "Ptr", this._fr, "Float", 0, "Float", 0)   ; IDWriteTextLayout::Draw
+      out := ""
+      for n in this._frNames
+         out .= (A_Index > 1 ? " + " : "") n
+      return out != "" ? out : "(unknown font)"
+   }
+
+   /**
+    * Renderer QueryInterface: answer only IUnknown, IDWritePixelSnapping and IDWriteTextRenderer, so DirectWrite
+    * never treats this object as an IDWriteTextRenderer1 (whose larger vtable it does not have).
+    */
+   static _FrQI(p, riid, ppv) {
+      static ok := "{00000000-0000-0000-C000-000000000046}|{EAF3A2DA-ECF4-4D24-B644-B34F6842024B}|{EF8A8135-5CC6-45FE-8825-C5A0724EB819}"
+      buf := Buffer(80)
+      DllCall("ole32\StringFromGUID2", "Ptr", riid, "Ptr", buf, "Int", 40)
+      if InStr(ok, StrGet(buf)) {
+         NumPut("Ptr", p, ppv)
+         return 0
+      }
+      NumPut("Ptr", 0, ppv)
+      return 0x80004002   ; E_NOINTERFACE
+   }
+
+   /**
+    * Renderer DrawGlyphRun: record the family name of the run's font face. Slots 3/4 (baseline x/y) are floats
+    * passed in XMM registers on x64 and are not used, so their values do not matter.
+    */
+   static _FrGlyphRun(p, ctx, bx, by, mode, run, desc, effect) {
+      try {
+         ; DWRITE_GLYPH_RUN_DESCRIPTION: localeName, string, stringLength, clusterMap, textPosition
+         len := NumGet(desc, 2 * A_PtrSize, "UInt")
+         pos := NumGet(desc, 3 * A_PtrSize + (A_PtrSize = 8 ? 8 : 4), "UInt")
+         if pos + len <= this._frSkip
+            return 0
+         ; DWRITE_GLYPH_RUN: fontFace, fontEmSize, glyphCount, glyphIndices, ...
+         face := NumGet(run, 0, "Ptr")
+         cnt := NumGet(run, A_PtrSize + 4, "UInt")
+         gi := NumGet(run, A_PtrSize + 8, "Ptr")
+         missing := cnt > 0
+         Loop cnt
+            if NumGet(gi, (A_Index - 1) * 2, "UShort") {
+               missing := false
+               break
+            }
+         name := "(unknown font)"
+         if !ComCall(6, this._coll, "Ptr", face, "Ptr*", &font := 0, "Int") {   ; GetFontFromFontFace
+            ComCall(3, font, "Ptr*", &fam := 0)                                ; IDWriteFont::GetFontFamily
+            ComCall(6, fam, "Ptr*", &ls := 0)                                  ; IDWriteFontFamily::GetFamilyNames
+            ComCall(4, ls, "Str", "en-us", "UInt*", &idx := 0, "Int*", &found := 0)   ; FindLocaleName
+            idx := found ? idx : 0
+            ComCall(7, ls, "UInt", idx, "UInt*", &n := 0)                      ; GetStringLength
+            VarSetStrCapacity(&name, n + 1)
+            ComCall(8, ls, "UInt", idx, "Str", name, "UInt", n + 1)            ; GetString
+            ObjRelease(ls), ObjRelease(fam), ObjRelease(font)
+         }
+         if missing
+            name .= " (missing)"
+         for x in this._frNames
+            if x = name
+               return 0
+         this._frNames.Push(name)
+      }
+      return 0
    }
    ; ---------------------------------------------------------------- messages
 
@@ -1647,8 +1815,8 @@ class UniBrowser {
          If StrLen(kw) > 140
             kw := SubStr(kw, 1, 140) "..."
          grp := UniData.Gr[i] != "" ? "   |   " UniData.Gr[i] : ""
-         this.txtInfo.Value := UniData.Nm[i] "`n" UniData.Hx[i] grp "`n" kw
          ob := this.CharMetrics(i)
+         this.txtInfo.Value := UniData.Nm[i] "   |   " ob.F "`n" UniData.Hx[i] grp "`n" kw
          m := ob.M, O := ob.O
          this.txtMetrics.Value := Format("Left {:.1f}   Top {:.1f}`nWidth {:.1f}   Trailing {:.1f}`nHeight {:.1f}   Lines {}`nOverhang {:.1f} x {:.1f}"
             , m.left, m.top, m.width, m.widthIncludingTrailingWhitespace, m.height, m.lineCount, -O.left, -O.right)
