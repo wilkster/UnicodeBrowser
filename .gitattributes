@@ -1,1 +1,2 @@
 *.ahk2 linguist-language=AutoHotkey
+*.bat linguist-detectable=false
